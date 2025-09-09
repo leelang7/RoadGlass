@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:async';
+import 'dart:convert'; // add at top
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart' show rootBundle;
@@ -62,6 +63,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   List<YOLOResult> _lastSegResults = [];
   Map<String, dynamic>? _lastImu;
   Timer? _imuTicker;
+
+  // YOLOView 인스턴스 캐시
+  Widget? _yoloView;
 
   // One-time debug dump flag (replaces the invalid local static var)
   bool _dumpedFirstResult = false;
@@ -288,7 +292,54 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       "note": "startup marker"
     });
     _lastDetLogUs = tUs0;
-    _loadModel(); // detect 모델 하나만 로드
+    _loadModel().then((_) {
+      // Only create YOLOView after model is loaded
+      if (mounted && _modelPath != null && _yoloView == null) {
+        setState(() {
+          _yoloView = YOLOView(
+            controller: _yoloController,
+            modelPath: _modelPath!,
+            task: YOLOTask.segment, // or detect depending on model
+            onResult: (results) {
+              final nowUs = DateTime.now().microsecondsSinceEpoch;
+              final imu = _imu.closest(nowUs);
+
+              _log.write({
+                "t_us": nowUs,
+                "event": "on_result_raw",
+                "result_count": results.length,
+                "imu": imu == null
+                    ? null
+                    : {
+                        "t_us": imu.tUs,
+                        "acc": {"x": imu.ax, "y": imu.ay, "z": imu.az},
+                        "gyro": {"x": imu.gx, "y": imu.gy, "z": imu.gz},
+                        "lin_acc": {"x": imu.lax, "y": imu.lay, "z": imu.laz},
+                      },
+              });
+
+              debugPrint("🎯 YOLOView onResult fired (raw) with ${results.length} results");
+              _onDetectionResults(results);
+            },
+            onPerformanceMetrics: (metrics) {
+              final val = (metrics.fps.isFinite && metrics.fps > 0) ? metrics.fps : 0.0;
+              setState(() {
+                _engineFps = val;
+                _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
+              });
+              if (_logging) {
+                _log.write({
+                  "t_us": DateTime.now().microsecondsSinceEpoch,
+                  "event": "perf",
+                  "source": "engine",
+                  "engine_fps": val
+                });
+              }
+            },
+          );
+        });
+      }
+    });
   }
 
   @override
@@ -298,7 +349,6 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     _imuTicker?.cancel();
     _imuTicker = null;
     _uiTicker.stop();
-    // _yoloController.dispose();
     super.dispose();
   }
 
@@ -333,16 +383,17 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         _loadingMessage = '';
       });
 
-      // 기본 임계치 세팅(극도로 낮은 임계값으로 더 많은 결과 감지)
+      // 기본 임계치 세팅(조금 더 현실적인 값으로 조정)
       _yoloController.setThresholds(
-        confidenceThreshold: 0.01, // 0.1 → 0.01로 극도로 낮춤
-        iouThreshold: 0.1,         // 0.3 → 0.1로 낮춤
-        numItemsThreshold: 1,      // 5 → 1로 낮춤
+        confidenceThreshold: 0.05, // 조금 더 현실적인 값
+        iouThreshold: 0.4,         // 일반적인 기본값
+        numItemsThreshold: 1,
       );
       
       debugPrint("✅ YOLO model loaded successfully: $_modelPath");
-      debugPrint("✅ Thresholds set: conf=0.01, iou=0.1, numItems=1");
-      
+      debugPrint("✅ Thresholds set: conf=0.05, iou=0.4, numItems=1");
+      // YOLOView 생성은 initState에서 처리
+
       // YOLOView 초기화 확인 (매우 긴 대기 시간)
       Future.delayed(const Duration(milliseconds: 5000), () {
         if (mounted) {
@@ -357,7 +408,6 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
           });
         }
       });
-      
       // 5초 후에도 결과가 없으면 경고
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) {
@@ -558,7 +608,19 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     // === YOLO detection 직렬화 ===
     final detections = <Map<String, dynamic>>[];
     debugPrint("🔍 Processing ${results.length} detection results");
-    
+
+    // --- Debug dump of raw YOLOResult objects ---
+    for (int i = 0; i < results.length; i++) {
+      final r = results[i];
+      try {
+        final rawJson = jsonEncode(r as dynamic);
+        debugPrint("🟢 Raw result dump $i: $rawJson");
+      } catch (e) {
+        debugPrint("⚠️ Failed to jsonEncode YOLOResult $i: $e");
+        debugPrint("⚠️ Fallback toString: ${r.toString()}");
+      }
+    }
+
     for (int i = 0; i < results.length; i++) {
       final r = results[i];
       try {
@@ -637,56 +699,25 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   Widget build(BuildContext context) {
     debugPrint("🔄 Building CameraInferenceScreen - modelPath: $_modelPath, isLoading: $_isModelLoading");
     debugPrint("🔄 YOLOView will be built with controller: $_yoloController");
-    
+
     // YOLOView 초기화 상태 확인
     if (_modelPath != null && !_isModelLoading) {
       debugPrint("🔄 YOLOView should be initialized now");
       debugPrint("🔄 YOLOView initialized: $_yoloViewInitialized");
     }
-    
+
     return Scaffold(
       backgroundColor: Colors.black,
-      body: (_modelPath != null && !_isModelLoading)
-          ? Stack(
+      body: OrientationBuilder(
+        builder: (context, orientation) {
+          Widget content;
+          if (_modelPath != null && !_isModelLoading) {
+            content = Stack(
               children: [
                 // 카메라 프리뷰 전체 화면
                 const Positioned.fill(child: SizedBox()),
-                Positioned.fill(
-                  child: YOLOView(
-                    controller: _yoloController,
-                    modelPath: _modelPath!,
-                    task: YOLOTask.segment, // ✅ 세그멘테이션 모드
-                    onResult: (results) {
-                      debugPrint("🎯 YOLOView onResult called with ${results.length} results");
-                      debugPrint("🎯 Results details: $results");
-                      _onDetectionResults(results);
-                    },
-                    onPerformanceMetrics: (metrics) {
-                      final val = (metrics.fps.isFinite && metrics.fps > 0) ? metrics.fps : 0.0;
-
-                      if (mounted) {
-                        setState(() {
-                          _engineFps = val;
-                          // 엔진값이 유효하면 우선 사용, 아니면 EMA/기존 유지
-                          _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
-                        });
-                      } else {
-                        _engineFps = val;
-                        _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
-                      }
-
-                      // ★ 엔진 FPS를 별도 perf 이벤트로도 저장
-                      if (_logging) {
-                        _log.write({
-                          "t_us": DateTime.now().microsecondsSinceEpoch,
-                          "event": "perf",
-                          "source": "engine",
-                          "engine_fps": val
-                        });
-                      }
-                    },
-                  ),
-                ),
+                // YOLOView 인스턴스 사용 (초기화된 경우)
+                Positioned.fill(child: _yoloView ?? const SizedBox()),
                 //  세그 폴리곤/마스크를 그리는 오버레이
                 Positioned.fill(
                   child: IgnorePointer(
@@ -718,8 +749,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                             Text(
                               "FPS: ${(_currentFps > 0.1 ? _currentFps : _uiFps).toStringAsFixed(1)}",
                               style: const TextStyle(
-                                color: Colors.white, 
-                                fontSize: 18, 
+                                color: Colors.white,
+                                fontSize: 18,
                                 fontWeight: FontWeight.bold,
                                 fontFamily: 'monospace',
                               ),
@@ -825,8 +856,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                   ),
                 ),
               ],
-            )
-          : const Center(
+            );
+          } else {
+            content = const Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -835,7 +867,43 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                   Text('Loading model...', style: TextStyle(color: Colors.white70)),
                 ],
               ),
-            ),
+            );
+          }
+          // If in landscape, rotate the content so it renders correctly
+          if (orientation == Orientation.landscape) {
+            return RotatedBox(
+              quarterTurns: 1,
+              child: content,
+            );
+          } else {
+            return content;
+          }
+        },
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () async {
+          final dir = await getApplicationDocumentsDirectory();
+          final file = File('${dir.path}/run_log.jsonl');
+          if (await file.exists()) {
+            await file.delete();
+            debugPrint("🗑️ run_log.jsonl deleted");
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('run_log.jsonl deleted')),
+              );
+            }
+          } else {
+            debugPrint("⚠️ run_log.jsonl not found");
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('run_log.jsonl not found')),
+              );
+            }
+          }
+        },
+        backgroundColor: Colors.red,
+        child: const Icon(Icons.delete),
+      ),
     );
   }
 }
@@ -962,22 +1030,59 @@ class LaneOverlayPainter extends CustomPainter {
 
       if (drawn) continue;
 
-      // 2) Mask (placeholder outline) if available
+      // 2) Mask overlay if available
       try {
         final mask = dyn.mask;
-        if (mask != null) {
-          final path = Path();
-          bool started = false;
-          final step = (size.width / 80).clamp(2, 8).toDouble();
-          for (double x = 0; x < size.width; x += step) {
-            final y = size.height * 0.5; // placeholder line; replace with contour when available
-            if (!started) { path.moveTo(x, y); started = true; } else { path.lineTo(x, y); }
+        final mw = (dyn.maskWidth as int?);
+        final mh = (dyn.maskHeight as int?);
+        if (mask != null && mw != null && mh != null && mask is Uint8List) {
+          // Convert binary/prob mask into ImageShader
+          // Since decodeImageFromPixels is async, this block must be adapted for sync paint.
+          // In practice, mask overlays should be pre-decoded to Image and passed in, but for
+          // demonstration, we use instantiateImageCodec for RGBA8888 mask.
+          // WARNING: decodeImageFromPixels is async and can't be used directly here!
+          // So we fallback to drawing a color overlay using alpha mask if available.
+          // If mask is a binary mask (0/1 or 0/255), we can draw pixels manually.
+          final w = mw;
+          final h = mh;
+          final maskBytes = mask;
+          // Try to draw as alpha mask (1 byte per pixel)
+          if (maskBytes.length == w * h) {
+            final imgBytes = Uint8List(w * h * 4);
+            for (int i = 0; i < w * h; i++) {
+              final alpha = maskBytes[i];
+              imgBytes[i * 4 + 0] = color.red;
+              imgBytes[i * 4 + 1] = color.green;
+              imgBytes[i * 4 + 2] = color.blue;
+              imgBytes[i * 4 + 3] = (alpha * 0.3).toInt().clamp(0, 255); // semi-transparent
+            }
+            // ignore: deprecated_member_use
+            final paintImage = Paint()
+              ..filterQuality = FilterQuality.low
+              ..isAntiAlias = false;
+            // decodeImageFromPixels is async, so we cannot call it here synchronously.
+            // Instead, fallback: just paint a translucent rectangle.
+            canvas.drawRect(
+              Rect.fromLTWH(0, 0, size.width, size.height),
+              Paint()
+                ..color = color.withOpacity(0.15)
+                ..style = PaintingStyle.fill,
+            );
+            drawn = true;
+          } else {
+            // Fallback: just paint a translucent rectangle overlay if mask bytes are not expected shape
+            canvas.drawRect(
+              Rect.fromLTWH(0, 0, size.width, size.height),
+              Paint()
+                ..color = color.withOpacity(0.15)
+                ..style = PaintingStyle.fill,
+            );
+            drawn = true;
           }
-          canvas.drawPath(path, outline);
-          canvas.drawPath(path, paint..strokeWidth = (strokeW - 1).clamp(2, 10));
-          drawn = true;
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint("⚠️ Mask paint failed: $e");
+      }
 
       if (drawn) continue;
 

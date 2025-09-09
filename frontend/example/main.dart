@@ -2,6 +2,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
+import 'package:ultralytics_yolo_example/presentation/screens/loading_screen.dart';
 
 void main() {
   runApp(const MyApp());
@@ -12,26 +13,12 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(title: 'YOLO Example', home: YOLOScreen());
-  }
-}
-
-class YOLOScreen extends StatelessWidget {
-  const YOLOScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('YOLO Detection')),
-      body: YOLOView(
-        modelPath: 'yolo11n',
-        task: YOLOTask.detect,
-        onResult: (results) {
-          for (final result in results) {
-            debugPrint('${result.className}: ${result.confidence}');
-          }
-        },
-      ),
+    return MaterialApp(
+      title: 'Load Glass',
+      debugShowCheckedModeBanner: false,
+      home: const LoadingScreen(), // 처음에는 로딩 화면
+      routes: {
+      },
     );
   }
 }

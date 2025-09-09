@@ -43,3 +43,4 @@ flutter:
     - assets/models/base_model_float16.tflite
     - assets/logo.png
     - assets/applogo.png
+    - assets/icon/MapPinRoad_maxfill_blue_1024.png
