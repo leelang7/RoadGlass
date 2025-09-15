@@ -3,7 +3,12 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:async';
 import 'dart:convert'; // add at top
+import 'dart:ui' as ui;
+import 'package:http/http.dart' as http;
+import 'package:geolocator/geolocator.dart';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
@@ -27,6 +32,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   final _yoloController = YOLOViewController();
   final _imu = ImuManager();
   final _log = LogWriter();      // 선택
+  final GlobalKey _yoloKey = GlobalKey();
+  final String serverUrl = "http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com/road_infer"; // 실제 엔드포인트로 교체
   bool _logging = false;         // 선택
   double _uiFps = 0.0;
   double _engineFps = 0.0;
@@ -234,6 +241,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                 "gyro": {"x": s.gx, "y": s.gy, "z": s.gz},
                 "lin_acc": {"x": s.lax, "y": s.lay, "z": s.laz},
               };
+        // Call IMU check/send after updating _lastImu
+        _checkImuAndSend();
       });
       if (_logging && _lastImu != null) {
         final nowUs2 = DateTime.now().microsecondsSinceEpoch;
@@ -355,6 +364,76 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   // 필요한 TFLite 파일명만 지정해서 사용하세요.
   // 예시: assets/models/base_model_float16.tflite
   String get _modelFileName => 'base_model_float16.tflite';
+
+  Future<void> _checkImuAndSend() async {
+    if (_lastImu == null) return;
+
+    // 먼저 GPS 위치(속도 포함) 가져오기
+    Position? pos;
+    try {
+      pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+    } catch (e) {
+      debugPrint("⚠️ GPS position fetch failed: $e");
+      return;
+    }
+
+    // 속도 체크 (단위: m/s → km/h)
+    double speedKmh = (pos.speed.isNaN || pos.speed.isInfinite) ? 0.0 : pos.speed * 3.6;
+    if (speedKmh < 15.0 || speedKmh > 90.0) {
+      debugPrint("⏩ Skip send: speed $speedKmh km/h not in [15, 90]");
+      return;
+    }
+
+    // IMU zAcc 체크
+    final double zAcc = (_lastImu?["acc"]["z"] as num).toDouble();
+    if (zAcc.abs() < 3.0) {
+      debugPrint("⏩ Skip send: zAcc $zAcc < 3.0");
+      return; // 방지턱 제외
+    }
+
+    try {
+      // 1. 카메라 캡쳐
+      final boundary = _yoloKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
+      final ui.Image image = await boundary.toImage(pixelRatio: 2.0);
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      final Uint8List pngBytes = byteData!.buffer.asUint8List();
+
+      // 3. Device ID 가져오기
+      final deviceInfo = DeviceInfoPlugin();
+      String deviceId = "unknown";
+      if (Platform.isAndroid) {
+        final androidInfo = await deviceInfo.androidInfo;
+        deviceId = androidInfo.id;
+      } else if (Platform.isIOS) {
+        final iosInfo = await deviceInfo.iosInfo;
+        deviceId = iosInfo.identifierForVendor ?? "ios-unknown";
+      }
+
+      // 5. multipart/form-data 요청 (lane_wear_infer API)
+      final request = http.MultipartRequest("POST", Uri.parse(
+        "http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com/lane_wear_infer",
+      ));
+      final now = DateTime.now().toIso8601String().replaceAll(':', '-');
+      final fname = "img_${deviceId}_$now.png";
+      
+      request.files.add(http.MultipartFile.fromBytes('file', pngBytes, filename: fname));
+      request.fields['gps_lat'] = pos.latitude.toString();
+      request.fields['gps_lon'] = pos.longitude.toString();
+      request.fields['timestamp'] = DateTime.now().toIso8601String();
+      request.fields['device_id'] = deviceId;
+      // request.fields['meta'] = meta; // ❌ no longer needed, see backend API
+
+      final response = await request.send();
+
+      if (response.statusCode == 200) {
+        debugPrint("✅ Frame + meta uploaded successfully");
+      } else {
+        debugPrint("❌ Upload failed (status: ${response.statusCode})");
+      }
+    } catch (e) {
+      debugPrint("⚠️ Capture/Upload failed: $e");
+    }
+  }
 
   Future<void> _loadModel() async {
     setState(() {
@@ -489,58 +568,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
 
   Map<String, dynamic> _encodeDetection(YOLOResult r) {
     try {
-      final dyn = r as dynamic;
-      debugPrint("🟢 Raw YOLOResult: ${dyn.toString()}");
-      
-      // 기본 정보
-      final result = <String, dynamic>{
+      return {
         "class": r.className ?? "unknown",
         "score": r.confidence ?? 0.0,
       };
-      
-      // bbox 정보 추출
-      try {
-        dynamic bboxSrc = dyn.bbox ?? dyn.rect ?? dyn.box ?? dyn.bounds ?? dyn.rectN ?? dyn.rectNormalized ?? dyn.rectF;
-        final bbox = _encodeBbox(bboxSrc);
-        if (bbox != null) result["bbox"] = bbox;
-      } catch (e) {
-        debugPrint("⚠️ Bbox encoding error: $e");
-      }
-      
-      // polygon 정보 추출
-      try {
-        final poly = _encodePolygon(dyn.polygon ?? dyn.points ?? dyn.polyline ?? dyn.path);
-        if (poly != null) result["polygon"] = poly;
-      } catch (e) {
-        debugPrint("⚠️ Polygon encoding error: $e");
-      }
-      
-      // mask 정보 추출
-      try {
-        final m = dyn.mask;
-        if (m != null) {
-          result["mask_info"] = {
-            "has": true,
-            if (dyn.maskWidth != null) "w": (dyn.maskWidth as num).toInt(),
-            if (dyn.maskHeight != null) "h": (dyn.maskHeight as num).toInt(),
-          };
-        }
-      } catch (e) {
-        debugPrint("⚠️ Mask encoding error: $e");
-      }
-      
-      // 추가 필드들
-      try {
-        if (dyn.classIndex != null) result["class_index"] = (dyn.classIndex as num).toInt();
-        if (dyn.classId != null) result["class_id"] = (dyn.classId as num).toInt();
-      } catch (e) {
-        debugPrint("⚠️ Additional fields encoding error: $e");
-      }
-      
-      return result;
     } catch (e) {
       debugPrint("❌ Detection encoding failed: $e");
-      // 최소한의 정보라도 반환
       return {
         "class": r.className ?? "unknown",
         "score": r.confidence ?? 0.0,
@@ -717,7 +750,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                 // 카메라 프리뷰 전체 화면
                 const Positioned.fill(child: SizedBox()),
                 // YOLOView 인스턴스 사용 (초기화된 경우)
-                Positioned.fill(child: _yoloView ?? const SizedBox()),
+                Positioned.fill(
+                  child: RepaintBoundary(
+                    key: _yoloKey,
+                    child: _yoloView ?? const SizedBox(),
+                  ),
+                ),
                 //  세그 폴리곤/마스크를 그리는 오버레이
                 Positioned.fill(
                   child: IgnorePointer(

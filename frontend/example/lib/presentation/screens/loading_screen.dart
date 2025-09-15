@@ -1,3 +1,4 @@
+import 'main_screen.dart';
 import 'package:flutter/material.dart';
 
 class LoadingScreen extends StatefulWidget {
@@ -12,7 +13,16 @@ class _LoadingScreenState extends State<LoadingScreen> {
   void initState() {
     super.initState();
     Future.delayed(Duration(seconds: 5), () {
-      Navigator.pushReplacementNamed(context, '/main');
+      Navigator.of(context).pushReplacement(PageRouteBuilder(
+        pageBuilder: (context, animation, secondaryAnimation) => const MainScreen(),
+        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+          return FadeTransition(
+            opacity: animation,
+            child: child,
+          );
+        },
+        transitionDuration: const Duration(milliseconds: 800),
+      ));
     });
   }
 

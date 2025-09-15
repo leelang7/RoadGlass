@@ -15,13 +15,18 @@ dependencies:
   image_picker: ^0.8.7
   path_provider: ^2.0.0 # Adjust version as needed
   archive: ^3.0.0 # Adjust version as needed, for unzipping
-  http: ^1.0.0 # For downloading models
+  http: ^1.2.2 # For downloading models
+  http_parser: ^4.1.2
+  device_info_plus: ^11.5.0
+  geolocator: ^14.0.2
   sensors_plus: ^6.1.2
+  cupertino_icons: ^1.0.8
 
   ultralytics_yolo:
     path: ../
 
-  cupertino_icons: ^1.0.8
+  
+
 
 dev_dependencies:
   integration_test:
@@ -34,7 +39,7 @@ dev_dependencies:
 flutter_launcher_icons:
   android: true
   ios: true
-  image_path: "assets/applogo.png"
+  image_path: "assets/icon/MapPinRoad_maxfill_blue_1024.png"
 
 flutter:
   uses-material-design: true
@@ -44,3 +49,10 @@ flutter:
     - assets/logo.png
     - assets/applogo.png
     - assets/icon/MapPinRoad_maxfill_blue_1024.png
+
+  fonts: 
+    - family: NanumSquareRound
+      fonts:
+        - asset: assets/fonts/NanumSquareRoundR.ttf
+        - asset: assets/fonts/NanumSquareRoundB.ttf
+          weight: 700

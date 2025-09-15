@@ -16,7 +16,7 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Load Glass',
       debugShowCheckedModeBanner: false,
-      home: const LoadingScreen(), // 처음에는 로딩 화면
+      home: const SingleImageExample(), // Directly launch YOLO test screen for desktop
       routes: {
       },
     );
@@ -47,6 +47,19 @@ class _SingleImageExampleState extends State<SingleImageExample> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(); // Simplified for brevity
+    return Scaffold(
+      appBar: AppBar(title: const Text('YOLO Desktop Test')),
+      body: Center(
+        child: YOLOView(
+          modelPath: 'yolo11n',
+          task: YOLOTask.detect,
+          onResult: (results) {
+            for (final r in results) {
+              debugPrint('Result: ${r.className} (${r.confidence})');
+            }
+          },
+        ),
+      ),
+    );
   }
 }
