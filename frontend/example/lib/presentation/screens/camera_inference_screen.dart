@@ -29,11 +29,14 @@ class CameraInferenceScreen extends StatefulWidget {
 }
 
 class _CameraInferenceScreenState extends State<CameraInferenceScreen> with SingleTickerProviderStateMixin {
+  // Backend base URL (unified)
+  static const String kBaseUrl = 'http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com';
+  static const String kInferPath = '/lane_wear_infer';
+  static const String kHealthPath = '/health';
   final _yoloController = YOLOViewController();
   final _imu = ImuManager();
   final _log = LogWriter();      // 선택
   final GlobalKey _yoloKey = GlobalKey();
-  final String serverUrl = "http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com/road_infer"; // 실제 엔드포인트로 교체
   bool _logging = false;         // 선택
   double _uiFps = 0.0;
   double _engineFps = 0.0;
@@ -61,6 +64,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   late final Ticker _uiTicker;
   int _uiFrameCount = 0;
   DateTime _lastUiFpsTs = DateTime.now();
+  DateTime? _lastEnqueueAt;
+  static const Duration _minEnqueueInterval = Duration(seconds: 2);
+  static const int _maxQueueItems = 1000; // PNG count upper bound
+  static const double _maxQueueMB = 500.0; // total size upper bound
   
   // FPS 히스토리 (최근 10개 프레임)
   final List<double> _fpsHistory = [];
@@ -70,6 +77,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   List<YOLOResult> _lastSegResults = [];
   Map<String, dynamic>? _lastImu;
   Timer? _imuTicker;
+  Timer? _syncTimer; // offline 큐 동기화 타이머
 
   // YOLOView 인스턴스 캐시
   Widget? _yoloView;
@@ -226,6 +234,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     super.initState();
     debugPrint("🚀 CameraInferenceScreen initState called");
     debugPrint("🚀 YOLOViewController created: $_yoloController");
+
+    // Request location permission at startup
+    _requestLocationPermission();
+
     _imu.start();
     // 🔄 IMU overlay updater (independent of YOLO onResult)
     _imuTicker = Timer.periodic(const Duration(milliseconds: 150), (_) {
@@ -290,6 +302,14 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       }
     });
     _uiTicker.start();
+    // Offline queue sync timer (주기적 재시도) with small random jitter
+    final delay = Duration(seconds: math.Random().nextInt(5));
+    Future.delayed(delay, () {
+      _syncTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+        _trySyncPending();
+      });
+      _trySyncPending(); // first attempt after jitter
+    });
     // 선택: 로깅 켜고 싶으면
     _logging = true;
     _log.openJsonl('run_log.jsonl');
@@ -358,12 +378,185 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     _imuTicker?.cancel();
     _imuTicker = null;
     _uiTicker.stop();
+    _syncTimer?.cancel();
+    _syncTimer = null;
     super.dispose();
   }
 
   // 필요한 TFLite 파일명만 지정해서 사용하세요.
   // 예시: assets/models/base_model_float16.tflite
   String get _modelFileName => 'base_model_float16.tflite';
+
+  // === Offline upload queue (file-based) ===
+  Future<Directory> _pendingDir() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final d = Directory('${dir.path}/pending_uploads');
+    if (!await d.exists()) {
+      await d.create(recursive: true);
+    }
+    return d;
+  }
+
+  Future<void> _trimQueueIfNeeded() async {
+    try {
+      final dir = await _pendingDir();
+      final files = await dir
+          .list()
+          .where((e) => e is File && (e.path.endsWith('.png') || e.path.endsWith('.json')))
+          .cast<File>()
+          .toList();
+      if (files.isEmpty) return;
+      files.sort((a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync())); // oldest first
+      final pngCount = files.where((f) => f.path.endsWith('.png')).length;
+      final totalMB = files.fold<int>(0, (acc, f) => acc + f.lengthSync()) / (1024 * 1024);
+      if (pngCount <= _maxQueueItems && totalMB <= _maxQueueMB) return;
+
+      int overItems = (pngCount - _maxQueueItems).clamp(0, pngCount);
+      int deleteBudget = overItems;
+      if (totalMB > _maxQueueMB) {
+        deleteBudget += 50; // heuristic: extra cleanup when size too big
+      }
+      int deleted = 0;
+      for (final f in files) {
+        if (deleted >= deleteBudget) break;
+        try { await f.delete(); deleted++; } catch (_) {}
+      }
+      debugPrint('🧹 Queue trimmed: deleted $deleted files (items=$pngCount, totalMB=${totalMB.toStringAsFixed(1)})');
+    } catch (e) {
+      debugPrint('🧹 Queue trim failed: $e');
+    }
+  }
+
+  Future<File> _policyFile() async {
+    final dir = await _pendingDir();
+    return File('${dir.path}/_policy.json');
+  }
+
+  Future<bool> _loadWifiOnlyPolicy() async {
+    try {
+      final f = await _policyFile();
+      if (await f.exists()) {
+        final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        return (j['wifi_only'] ?? true) == true;
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  Future<bool> _isOnline() async {
+    try {
+      final resp = await http.get(Uri.parse('$kBaseUrl$kHealthPath')).timeout(const Duration(seconds: 2));
+      return resp.statusCode == 200;
+    } catch (_) { return false; }
+  }
+
+  Future<void> _enqueueUpload({required Uint8List pngBytes, required Position pos, required String deviceId, required String trigger}) async {
+    final dir = await _pendingDir();
+    final ts = DateTime.now();
+    final safeTs = ts.toIso8601String().replaceAll(':', '-');
+    final base = 'item_${deviceId}_$safeTs';
+    final imgFile = File('${dir.path}/$base.png');
+    final metaFile = File('${dir.path}/$base.json');
+
+    final meta = {
+      "t_us": ts.microsecondsSinceEpoch,
+      "device_id": deviceId,
+      "gps": {
+        "lat": pos.latitude,
+        "lon": pos.longitude,
+        "accuracy": pos.accuracy,
+        "speed_kmh": ((pos.speed.isNaN || pos.speed.isInfinite) ? 0.0 : pos.speed * 3.6),
+      },
+      "trigger": trigger,
+    };
+
+    await imgFile.writeAsBytes(pngBytes, flush: true);
+    await metaFile.writeAsString(jsonEncode(meta), flush: true);
+    await _trimQueueIfNeeded();
+    debugPrint('📦 Enqueued offline upload: ${imgFile.path}');
+  }
+
+  Future<bool> _trySyncPending() async {
+    try {
+      final wifiOnly = await _loadWifiOnlyPolicy();
+      final online = await _isOnline();
+      if (wifiOnly && !online) {
+        debugPrint('📶 Wi‑Fi only policy active and offline → skip sync');
+        return false;
+      }
+      final dir = await _pendingDir();
+      final entries = await dir.list().toList();
+      final pngs = entries.whereType<File>().where((f) => f.path.endsWith('.png')).toList();
+      int success = 0;
+      for (final png in pngs) {
+        final metaPath = png.path.replaceAll('.png', '.json');
+        final metaFile = File(metaPath);
+        if (!await metaFile.exists()) continue;
+        Map<String, dynamic> meta;
+        try {
+          meta = jsonDecode(await metaFile.readAsString()) as Map<String, dynamic>;
+        } catch (e) {
+          debugPrint('⚠️ Meta parse failed for ${metaFile.path}: $e');
+          continue;
+        }
+        final bytes = await png.readAsBytes();
+
+        if (bytes.length > 20 * 1024 * 1024) {
+          debugPrint('🚫 Skip upload (>20MB): ${png.path}');
+          continue;
+        }
+        final request = http.MultipartRequest('POST', Uri.parse('$kBaseUrl$kInferPath'));
+        final fname = png.uri.pathSegments.last;
+        request.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fname));
+
+        final gps = (meta['gps'] as Map?) ?? {};
+        request.fields['gps_lat'] = (gps['lat'] ?? '').toString();
+        request.fields['gps_lon'] = (gps['lon'] ?? '').toString();
+        request.fields['timestamp'] = DateTime.now().toIso8601String();
+        request.fields['device_id'] = (meta['device_id'] ?? 'unknown').toString();
+
+        try {
+          final resp = await request.send().timeout(const Duration(seconds: 12));
+          String body = '';
+          try { body = await resp.stream.bytesToString(); } catch (_) {}
+          if (resp.statusCode == 200) {
+            success++;
+            try {
+              if (body.isNotEmpty) {
+                final j = jsonDecode(body) as Map<String, dynamic>;
+                final overlayUrl = j['overlay_url'] as String?;
+                if (overlayUrl != null && overlayUrl.isNotEmpty) {
+                  final ovResp = await http.get(Uri.parse(overlayUrl)).timeout(const Duration(seconds: 3));
+                  if (ovResp.statusCode == 200 && ovResp.bodyBytes.isNotEmpty) {
+                    final ovPath = png.path.replaceAll('.png', '_overlay.jpg');
+                    await File(ovPath).writeAsBytes(ovResp.bodyBytes, flush: true);
+                  }
+                }
+              }
+            } catch (_) {}
+            await png.delete();
+            await metaFile.delete();
+          } else if (resp.statusCode == 413) {
+            debugPrint('🚫 413 Payload Too Large');
+          } else if (resp.statusCode == 415) {
+            debugPrint('🚫 415 Unsupported Media Type');
+          } else if (resp.statusCode == 400) {
+            debugPrint('🚫 400 Bad Request: $body');
+          } else {
+            debugPrint('❌ Sync failed (${resp.statusCode}): $body');
+          }
+        } catch (e) {
+          debugPrint('📶 Offline: sync attempt failed for ${png.path}: $e');
+        }
+      }
+      debugPrint('🔁 Sync complete: $success item(s) uploaded');
+      await _trimQueueIfNeeded();
+      return success > 0;
+    } catch (e) {
+      debugPrint('⚠️ Sync error: $e');
+      return false;
+    }
+  }
 
   Future<void> _checkImuAndSend() async {
     if (_lastImu == null) return;
@@ -379,8 +572,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
 
     // 속도 체크 (단위: m/s → km/h)
     double speedKmh = (pos.speed.isNaN || pos.speed.isInfinite) ? 0.0 : pos.speed * 3.6;
-    if (speedKmh < 15.0 || speedKmh > 90.0) {
-      debugPrint("⏩ Skip send: speed $speedKmh km/h not in [15, 90]");
+    if (speedKmh < 15.0 || speedKmh > 50.0) {
+      debugPrint("⏩ Skip send: speed $speedKmh km/h not in [15, 50]");
       return;
     }
 
@@ -392,11 +585,54 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     }
 
     try {
-      // 1. 카메라 캡쳐
-      final boundary = _yoloKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
-      final ui.Image image = await boundary.toImage(pixelRatio: 2.0);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      final Uint8List pngBytes = byteData!.buffer.asUint8List();
+      // 1. 카메라 캡쳐 (null safety + lower pixel ratio)
+      final ctx = _yoloKey.currentContext;
+      if (ctx == null) {
+        debugPrint('⚠️ yoloKey context is null');
+        return;
+      }
+      final boundary = ctx.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) {
+        debugPrint('⚠️ RepaintBoundary not found');
+        return;
+      }
+
+      ui.Image? image;
+      Uint8List pngBytes;
+      int capW = 0, capH = 0;
+      try {
+        image = await boundary.toImage(pixelRatio: 1.5);
+        capW = image.width;
+        capH = image.height;
+        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) {
+          debugPrint('⚠️ Failed to get image bytes');
+          return;
+        }
+        pngBytes = byteData.buffer.asUint8List();
+      } finally {
+        try { image?.dispose(); } catch (_) {}
+      }
+
+      // Downscale to max 1280px (longest side)
+      Uint8List resizedBytes = pngBytes;
+      try {
+        final codec = await ui.instantiateImageCodec(
+          pngBytes,
+          targetWidth: (capW >= capH && capW > 0) ? 1280 : null,
+          targetHeight: (capH > capW && capH > 0) ? 1280 : null,
+        );
+        final fi = await codec.getNextFrame();
+        final rb = await fi.image.toByteData(format: ui.ImageByteFormat.png);
+        if (rb != null) resizedBytes = rb.buffer.asUint8List();
+      } catch (_) {}
+
+      // Upload throttle (min interval)
+      final now = DateTime.now();
+      if (_lastEnqueueAt != null && now.difference(_lastEnqueueAt!) < _minEnqueueInterval) {
+        debugPrint('⏸️ Cooldown: skip enqueue');
+        return;
+      }
 
       // 3. Device ID 가져오기
       final deviceInfo = DeviceInfoPlugin();
@@ -409,27 +645,15 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         deviceId = iosInfo.identifierForVendor ?? "ios-unknown";
       }
 
-      // 5. multipart/form-data 요청 (lane_wear_infer API)
-      final request = http.MultipartRequest("POST", Uri.parse(
-        "http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com/lane_wear_infer",
-      ));
-      final now = DateTime.now().toIso8601String().replaceAll(':', '-');
-      final fname = "img_${deviceId}_$now.png";
-      
-      request.files.add(http.MultipartFile.fromBytes('file', pngBytes, filename: fname));
-      request.fields['gps_lat'] = pos.latitude.toString();
-      request.fields['gps_lon'] = pos.longitude.toString();
-      request.fields['timestamp'] = DateTime.now().toIso8601String();
-      request.fields['device_id'] = deviceId;
-      // request.fields['meta'] = meta; // ❌ no longer needed, see backend API
-
-      final response = await request.send();
-
-      if (response.statusCode == 200) {
-        debugPrint("✅ Frame + meta uploaded successfully");
-      } else {
-        debugPrint("❌ Upload failed (status: ${response.statusCode})");
-      }
+      // 5. Offline-first: 큐에 저장 후 백그라운드 동기화 시도
+      await _enqueueUpload(
+        pngBytes: resizedBytes,
+        pos: pos,
+        deviceId: deviceId,
+        trigger: 'z_acc_threshold',
+      );
+      _lastEnqueueAt = now;
+      await _trySyncPending();
     } catch (e) {
       debugPrint("⚠️ Capture/Upload failed: $e");
     }
@@ -1171,3 +1395,24 @@ class LaneOverlayPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant LaneOverlayPainter old) => old.results != results;
 }
+  // Location permission request at startup
+  Future<void> _requestLocationPermission() async {
+    debugPrint("📍 Checking location permission...");
+    LocationPermission permission = await Geolocator.checkPermission();
+    debugPrint("📍 Initial location permission status: $permission");
+    if (permission == LocationPermission.denied) {
+      debugPrint("📍 Location permission denied, requesting...");
+      permission = await Geolocator.requestPermission();
+      debugPrint("📍 Requested location permission, new status: $permission");
+    }
+    if (permission == LocationPermission.deniedForever) {
+      debugPrint("📍 Location permission denied forever. Opening app settings...");
+      await Geolocator.openAppSettings();
+      // Optionally, you can show a dialog/snackbar here
+    }
+    if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
+      debugPrint("📍 Location permission granted: $permission");
+    } else {
+      debugPrint("📍 Location permission NOT granted: $permission");
+    }
+  }

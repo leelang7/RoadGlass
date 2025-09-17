@@ -3,6 +3,8 @@ import 'presentation/screens/camera_inference_screen.dart';
 import 'presentation/screens/main_screen.dart';
 import 'presentation/screens/loading_screen.dart';
 import 'presentation/screens/guide_screen.dart';
+import 'presentation/screens/setting_screen.dart';
+import 'presentation/screens/app_dashboard_screen.dart';
 
 void main() {
   runApp(const App());
@@ -25,6 +27,8 @@ class App extends StatelessWidget {
         '/main': (_) => const MainScreen(),
         '/camera': (_) => const CameraInferenceScreen(),
         '/guide': (_) => const GuideScreen(),
+        // '/settings': (_) => const SettingScreen(),
+        '/dashboard': (_) => const AppDashboardScreen(),
       },
     );
   }
