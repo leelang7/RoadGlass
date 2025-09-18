@@ -82,6 +82,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   // YOLOView 인스턴스 캐시
   Widget? _yoloView;
 
+  // 카메라 자동 시작 제어 (가이드 화면에서 권한 받은 뒤 autoStart=true로 진입하면 바로 시작)
+  bool _cameraReady = false;
+
   // One-time debug dump flag (replaces the invalid local static var)
   bool _dumpedFirstResult = false;
 
@@ -235,8 +238,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     debugPrint("🚀 CameraInferenceScreen initState called");
     debugPrint("🚀 YOLOViewController created: $_yoloController");
 
-    // Request location permission at startup
-    _requestLocationPermission();
+    // (위치 권한 요청 제거됨: 가이드 화면에서 요청)
 
     _imu.start();
     // 🔄 IMU overlay updater (independent of YOLO onResult)
@@ -322,53 +324,63 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     });
     _lastDetLogUs = tUs0;
     _loadModel().then((_) {
-      // Only create YOLOView after model is loaded
-      if (mounted && _modelPath != null && _yoloView == null) {
-        setState(() {
-          _yoloView = YOLOView(
-            controller: _yoloController,
-            modelPath: _modelPath!,
-            task: YOLOTask.segment, // or detect depending on model
-            onResult: (results) {
-              final nowUs = DateTime.now().microsecondsSinceEpoch;
-              final imu = _imu.closest(nowUs);
-
-              _log.write({
-                "t_us": nowUs,
-                "event": "on_result_raw",
-                "result_count": results.length,
-                "imu": imu == null
-                    ? null
-                    : {
-                        "t_us": imu.tUs,
-                        "acc": {"x": imu.ax, "y": imu.ay, "z": imu.az},
-                        "gyro": {"x": imu.gx, "y": imu.gy, "z": imu.gz},
-                        "lin_acc": {"x": imu.lax, "y": imu.lay, "z": imu.laz},
-                      },
-              });
-
-              debugPrint("🎯 YOLOView onResult fired (raw) with ${results.length} results");
-              _onDetectionResults(results);
-            },
-            onPerformanceMetrics: (metrics) {
-              final val = (metrics.fps.isFinite && metrics.fps > 0) ? metrics.fps : 0.0;
-              setState(() {
-                _engineFps = val;
-                _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
-              });
-              if (_logging) {
-                _log.write({
-                  "t_us": DateTime.now().microsecondsSinceEpoch,
-                  "event": "perf",
-                  "source": "engine",
-                  "engine_fps": val
-                });
-              }
-            },
-          );
-        });
+      // Only create YOLOView after model is loaded and camera is ready
+      if (mounted && _modelPath != null && _yoloView == null && _cameraReady) {
+        _armCameraAndBuild();
       }
     });
+  }
+
+  // 카메라 준비 신호를 받고, 모델이 이미 로드된 경우 YOLOView를 생성
+  void _armCameraAndBuild() {
+    // Mark camera as ready (permission granted), but do NOT early-return.
+    // We may be called before the model loads; when the model arrives, we need to build YOLOView.
+    _cameraReady = true;
+    if (!mounted) return;
+    if (_modelPath != null && _yoloView == null) {
+      setState(() {
+        _yoloView = YOLOView(
+          controller: _yoloController,
+          modelPath: _modelPath!,
+          task: YOLOTask.segment,
+          onResult: (results) {
+            final nowUs = DateTime.now().microsecondsSinceEpoch;
+            final imu = _imu.closest(nowUs);
+            _log.write({
+              "t_us": nowUs,
+              "event": "on_result_raw",
+              "result_count": results.length,
+              "imu": imu == null
+                  ? null
+                  : {
+                      "t_us": imu.tUs,
+                      "acc": {"x": imu.ax, "y": imu.ay, "z": imu.az},
+                      "gyro": {"x": imu.gx, "y": imu.gy, "z": imu.gz},
+                      "lin_acc": {"x": imu.lax, "y": imu.lay, "z": imu.laz},
+                    },
+            });
+            _onDetectionResults(results);
+          },
+          onPerformanceMetrics: (m) {
+            final val = (m.fps.isFinite && m.fps > 0) ? m.fps : 0.0;
+            setState(() {
+              _engineFps = val;
+              _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
+            });
+            if (_logging) {
+              _log.write({
+                "t_us": DateTime.now().microsecondsSinceEpoch,
+                "event": "perf",
+                "source": "engine",
+                "engine_fps": val
+              });
+            }
+          },
+        );
+      });
+    } else {
+      setState(() {}); // 모델 로딩 후 빌드 갱신을 위해
+    }
   }
 
   @override
@@ -561,6 +573,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   Future<void> _checkImuAndSend() async {
     if (_lastImu == null) return;
 
+    // 위치 권한이 여기서 팝업되지 않도록: 미승인 시 스킵
+    final perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
+      debugPrint("📍 Location permission not granted (skip in camera screen)");
+      return;
+    }
     // 먼저 GPS 위치(속도 포함) 가져오기
     Position? pos;
     try {
@@ -963,162 +981,201 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       debugPrint("🔄 YOLOView initialized: $_yoloViewInitialized");
     }
 
+    // 자동 시작 요청 및 카메라 무대기 해제
+    final args = ModalRoute.of(context)?.settings.arguments;
+    final bool autoStart = (args is Map && args['autoStart'] == true);
+    if (autoStart && !_cameraReady) {
+      // 빌드 중 setState 방지: 다음 마이크로태스크에서 arm
+      Future.microtask(_armCameraAndBuild);
+    }
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: OrientationBuilder(
         builder: (context, orientation) {
           Widget content;
           if (_modelPath != null && !_isModelLoading) {
-            content = Stack(
-              children: [
-                // 카메라 프리뷰 전체 화면
-                const Positioned.fill(child: SizedBox()),
-                // YOLOView 인스턴스 사용 (초기화된 경우)
-                Positioned.fill(
-                  child: RepaintBoundary(
-                    key: _yoloKey,
-                    child: _yoloView ?? const SizedBox(),
-                  ),
-                ),
-                //  세그 폴리곤/마스크를 그리는 오버레이
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: CustomPaint(
-                      painter: LaneOverlayPainter(results: _lastSegResults),
-                    ),
-                  ),
-                ),
-                // FPS 표시 (우상단)
-                Positioned(
-                  top: MediaQuery.of(context).padding.top + 12,
-                  right: 16,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-                    decoration: BoxDecoration(
-                      color: Colors.black87,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.white24, width: 1),
-                    ),
+            content = _cameraReady
+                ? Stack(
+                    children: [
+                      // 카메라 프리뷰 전체 화면
+                      const Positioned.fill(child: SizedBox()),
+                      // YOLOView 인스턴스 사용 (초기화된 경우)
+                      Positioned.fill(
+                        child: RepaintBoundary(
+                          key: _yoloKey,
+                          child: _yoloView ?? const SizedBox(),
+                        ),
+                      ),
+                      //  세그 폴리곤/마스크를 그리는 오버레이
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: CustomPaint(
+                            painter: LaneOverlayPainter(results: _lastSegResults),
+                          ),
+                        ),
+                      ),
+                      // FPS 표시 (우상단)
+                      Positioned(
+                        top: MediaQuery.of(context).padding.top + 12,
+                        right: 16,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: Colors.black87,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.white24, width: 1),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.speed, color: Colors.greenAccent, size: 16),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    "FPS: ${(_currentFps > 0.1 ? _currentFps : _uiFps).toStringAsFixed(1)}",
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                      fontFamily: 'monospace',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    decoration: BoxDecoration(
+                                      color: _currentFps > 0.1 ? Colors.greenAccent : Colors.orange,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    "Engine: ${_currentFps > 0.1 ? 'ON' : 'OFF'}",
+                                    style: TextStyle(
+                                      color: _currentFps > 0.1 ? Colors.greenAccent : Colors.orange,
+                                      fontSize: 12,
+                                      fontFamily: 'monospace',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              if (_emaFps > 0.1 && _currentFps <= 0.1)
+                                Text(
+                                  "EMA: ${_emaFps.toStringAsFixed(1)}",
+                                  style: const TextStyle(
+                                    color: Colors.blueAccent,
+                                    fontSize: 12,
+                                    fontFamily: 'monospace',
+                                  ),
+                                ),
+                              if (_fpsHistory.isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  "Min: ${_fpsHistory.reduce((a, b) => a < b ? a : b).toStringAsFixed(1)}",
+                                  style: const TextStyle(
+                                    color: Colors.redAccent,
+                                    fontSize: 10,
+                                    fontFamily: 'monospace',
+                                  ),
+                                ),
+                                Text(
+                                  "Max: ${_fpsHistory.reduce((a, b) => a > b ? a : b).toStringAsFixed(1)}",
+                                  style: const TextStyle(
+                                    color: Colors.greenAccent,
+                                    fontSize: 10,
+                                    fontFamily: 'monospace',
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                      ),
+                      // IMU 정보 (좌상단 - FPS 패널 아래로 이동)
+                      Positioned(
+                        top: MediaQuery.of(context).padding.top + 120,
+                        left: 16,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: Colors.black54,
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (_lastImu == null)
+                                const Text(
+                                  "IMU: -",
+                                  style: TextStyle(color: Colors.white, fontSize: 14),
+                                )
+                              else ...[
+                                Text(
+                                  "ACC  x:${(_lastImu?["acc"]["x"] as num).toStringAsFixed(2)}  "
+                                  "y:${(_lastImu?["acc"]["y"] as num).toStringAsFixed(2)}  "
+                                  "z:${(_lastImu?["acc"]["z"] as num).toStringAsFixed(2)}",
+                                  style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'monospace'),
+                                ),
+                                Text(
+                                  "GYRO x:${(_lastImu?["gyro"]["x"] as num).toStringAsFixed(2)}  "
+                                  "y:${(_lastImu?["gyro"]["y"] as num).toStringAsFixed(2)}  "
+                                  "z:${(_lastImu?["gyro"]["z"] as num).toStringAsFixed(2)}",
+                                  style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'monospace'),
+                                ),
+                                Text(
+                                  "LIN  x:${(_lastImu?["lin_acc"]["x"] as num).toStringAsFixed(2)}  "
+                                  "y:${(_lastImu?["lin_acc"]["y"] as num).toStringAsFixed(2)}  "
+                                  "z:${(_lastImu?["lin_acc"]["z"] as num).toStringAsFixed(2)}",
+                                  style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'monospace'),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  )
+                : Center(
                     child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.speed, color: Colors.greenAccent, size: 16),
-                            const SizedBox(width: 4),
-                            Text(
-                              "FPS: ${(_currentFps > 0.1 ? _currentFps : _uiFps).toStringAsFixed(1)}",
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
-                                fontFamily: 'monospace',
-                              ),
-                            ),
-                          ],
+                        const Icon(Icons.camera_alt_rounded, color: Colors.white70, size: 64),
+                        const SizedBox(height: 12),
+                        const Text(
+                          '카메라 시작 준비됨',
+                          style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
                         ),
-                        const SizedBox(height: 4),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Container(
-                              width: 8,
-                              height: 8,
-                              decoration: BoxDecoration(
-                                color: _currentFps > 0.1 ? Colors.greenAccent : Colors.orange,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-                            const SizedBox(width: 4),
-                            Text(
-                              "Engine: ${_currentFps > 0.1 ? 'ON' : 'OFF'}",
-                              style: TextStyle(
-                                color: _currentFps > 0.1 ? Colors.greenAccent : Colors.orange,
-                                fontSize: 12,
-                                fontFamily: 'monospace',
-                              ),
-                            ),
-                          ],
+                        const SizedBox(height: 6),
+                        const Text(
+                          '가이드 화면에서 카메라 권한을 허용했으면\n아래 버튼으로 실시간 감지를 시작하세요.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.white70, fontSize: 14),
                         ),
-                        if (_emaFps > 0.1 && _currentFps <= 0.1)
-                          Text(
-                            "EMA: ${_emaFps.toStringAsFixed(1)}",
-                            style: const TextStyle(
-                              color: Colors.blueAccent,
-                              fontSize: 12,
-                              fontFamily: 'monospace',
-                            ),
+                        const SizedBox(height: 16),
+                        ElevatedButton.icon(
+                          onPressed: _armCameraAndBuild,
+                          icon: const Icon(Icons.play_arrow_rounded),
+                          label: const Text('카메라 시작'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blueAccent,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                           ),
-                        if (_fpsHistory.isNotEmpty) ...[
-                          const SizedBox(height: 2),
-                          Text(
-                            "Min: ${_fpsHistory.reduce((a, b) => a < b ? a : b).toStringAsFixed(1)}",
-                            style: const TextStyle(
-                              color: Colors.redAccent,
-                              fontSize: 10,
-                              fontFamily: 'monospace',
-                            ),
-                          ),
-                          Text(
-                            "Max: ${_fpsHistory.reduce((a, b) => a > b ? a : b).toStringAsFixed(1)}",
-                            style: const TextStyle(
-                              color: Colors.greenAccent,
-                              fontSize: 10,
-                              fontFamily: 'monospace',
-                            ),
-                          ),
-                        ],
+                        ),
                       ],
                     ),
-                  ),
-                ),
-                // IMU 정보 (좌상단 - FPS 패널 아래로 이동)
-                Positioned(
-                  top: MediaQuery.of(context).padding.top + 120, // FPS 패널 아래로 이동
-                  left: 16,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (_lastImu == null)
-                          const Text(
-                            "IMU: -",
-                            style: TextStyle(color: Colors.white, fontSize: 14),
-                          )
-                        else ...[
-                          Text(
-                            "ACC  x:${(_lastImu?["acc"]["x"] as num).toStringAsFixed(2)}  "
-                            "y:${(_lastImu?["acc"]["y"] as num).toStringAsFixed(2)}  "
-                            "z:${(_lastImu?["acc"]["z"] as num).toStringAsFixed(2)}",
-                            style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'monospace'),
-                          ),
-                          Text(
-                            "GYRO x:${(_lastImu?["gyro"]["x"] as num).toStringAsFixed(2)}  "
-                            "y:${(_lastImu?["gyro"]["y"] as num).toStringAsFixed(2)}  "
-                            "z:${(_lastImu?["gyro"]["z"] as num).toStringAsFixed(2)}",
-                            style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'monospace'),
-                          ),
-                          Text(
-                            "LIN  x:${(_lastImu?["lin_acc"]["x"] as num).toStringAsFixed(2)}  "
-                            "y:${(_lastImu?["lin_acc"]["y"] as num).toStringAsFixed(2)}  "
-                            "z:${(_lastImu?["lin_acc"]["z"] as num).toStringAsFixed(2)}",
-                            style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'monospace'),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            );
+                  );
           } else {
             content = const Center(
               child: Column(
@@ -1395,24 +1452,4 @@ class LaneOverlayPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant LaneOverlayPainter old) => old.results != results;
 }
-  // Location permission request at startup
-  Future<void> _requestLocationPermission() async {
-    debugPrint("📍 Checking location permission...");
-    LocationPermission permission = await Geolocator.checkPermission();
-    debugPrint("📍 Initial location permission status: $permission");
-    if (permission == LocationPermission.denied) {
-      debugPrint("📍 Location permission denied, requesting...");
-      permission = await Geolocator.requestPermission();
-      debugPrint("📍 Requested location permission, new status: $permission");
-    }
-    if (permission == LocationPermission.deniedForever) {
-      debugPrint("📍 Location permission denied forever. Opening app settings...");
-      await Geolocator.openAppSettings();
-      // Optionally, you can show a dialog/snackbar here
-    }
-    if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
-      debugPrint("📍 Location permission granted: $permission");
-    } else {
-      debugPrint("📍 Location permission NOT granted: $permission");
-    }
-  }
+  // Location permission request at startup (이전 위치 권한 요청 함수, 더 이상 사용하지 않음)
