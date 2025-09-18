@@ -490,9 +490,11 @@ class PoseEstimator(
                     @Suppress("UNCHECKED_CAST")
                     val data = yaml.load<Map<String, Any>>(fileString)
                     if (data != null && data.containsKey("names")) {
-                        val namesMap = data["names"] as? Map<Int, String>
-                        if (namesMap != null) {
-                            labels = namesMap.values.toList()
+                        val namesMapRaw = data["names"] as? Map<String, Any>
+                        if (namesMapRaw != null) {
+                            labels = namesMapRaw.entries
+                                .sortedBy { it.key.toIntOrNull() ?: Int.MAX_VALUE }
+                                .map { it.value.toString() }
                             Log.d("PoseEstimator", "Loaded labels from metadata: $labels")
                             return true
                         }

@@ -2,8 +2,11 @@
 
 package com.ultralytics.yolo
 
+import com.ultralytics.yolo.YOLOResult
+
 import android.content.Context
 import android.util.Log
+import android.util.Base64
 import android.view.View
 import androidx.lifecycle.LifecycleOwner
 import io.flutter.plugin.common.EventChannel
@@ -104,7 +107,14 @@ class YOLOPlatformView(
             
             // Set up inference callback
             yoloView.setOnInferenceCallback { result ->
-                // Callback for compatibility
+                // Send flat event that matches Flutter expectation
+                val event = HashMap<String, Any>()
+                event["detections"] = result.toDetectionsMap()
+                result.fps?.let { fpsVal -> event["fps"] = fpsVal }
+                event["processingTimeMs"] = result.speed
+                event["viewId"] = viewUniqueId
+                event["timestamp"] = System.currentTimeMillis()
+                sendStreamDataWithRetry(event)
             }
             
             // Load model
@@ -449,3 +459,12 @@ class YOLOPlatformView(
         }
     }
 }
+    /**
+     * Helper function to convert a YOLOResult to a Map<String, Any?> for streaming.
+     * Uses YOLOResult.toDetectionsMap() to build the detection list.
+     */
+    private fun yoloResultToMap(result: YOLOResult): Map<String, Any?> {
+        return mapOf(
+            "detections" to result.toDetectionsMap()
+        )
+    }

@@ -422,9 +422,20 @@ class Segmenter(
                     @Suppress("UNCHECKED_CAST")
                     val data = yaml.load<Map<String, Any>>(fileString)
                     if (data != null && data.containsKey("names")) {
-                        val namesMap = data["names"] as? Map<Int, String>
-                        if (namesMap != null) {
-                            labels = namesMap.values.toList()
+                        val namesAny = data["names"]
+                        if (namesAny is Map<*, *>) {
+                            // Convert keys to Int safely
+                            val parsed = namesAny.entries.mapNotNull { (k, v) ->
+                                val keyInt = when (k) {
+                                    is Int -> k
+                                    is String -> k.toIntOrNull()
+                                    else -> null
+                                }
+                                val valueStr = v?.toString()
+                                if (keyInt != null && valueStr != null) keyInt to valueStr else null
+                            }.sortedBy { it.first }
+
+                            labels = parsed.map { it.second }
                             Log.d("Segmenter", "Loaded labels from metadata: $labels")
                             return true
                         }

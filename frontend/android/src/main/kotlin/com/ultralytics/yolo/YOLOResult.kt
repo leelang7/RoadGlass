@@ -24,8 +24,8 @@ data class Box(
     var index: Int,
     var cls: String,
     var conf: Float,
-    val xywh: RectF,    // Real image coordinates
-    val xywhn: RectF    // Normalized coordinates (0~1)
+    var xywh: RectF,    // Real image coordinates
+    var xywhn: RectF    // Normalized coordinates (0~1)
 )
 
 data class Masks(
@@ -55,3 +55,26 @@ data class OBBResult(
 )
 
 data class Size(val width: Int, val height: Int)
+
+
+fun YOLOResult.toDetectionsMap(): List<Map<String, Any>> {
+    val detections = mutableListOf<Map<String, Any>>()
+    this.boxes.forEach { box ->
+        val className = box.cls
+        val confidence = box.conf
+        val bbox = mapOf(
+            "x" to box.xywh.left,
+            "y" to box.xywh.top,
+            "width" to box.xywh.width(),
+            "height" to box.xywh.height()
+        )
+        detections.add(
+            mapOf(
+                "className" to className,
+                "confidence" to confidence,
+                "bbox" to bbox
+            )
+        )
+    }
+    return detections
+}

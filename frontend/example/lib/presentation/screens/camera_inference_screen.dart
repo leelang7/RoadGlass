@@ -2,7 +2,13 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:async';
+import 'dart:convert'; // add at top
+import 'dart:ui' as ui;
+import 'package:http/http.dart' as http;
+import 'package:geolocator/geolocator.dart';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
@@ -23,9 +29,14 @@ class CameraInferenceScreen extends StatefulWidget {
 }
 
 class _CameraInferenceScreenState extends State<CameraInferenceScreen> with SingleTickerProviderStateMixin {
+  // Backend base URL (unified)
+  static const String kBaseUrl = 'http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com';
+  static const String kInferPath = '/lane_wear_infer';
+  static const String kHealthPath = '/health';
   final _yoloController = YOLOViewController();
   final _imu = ImuManager();
   final _log = LogWriter();      // 선택
+  final GlobalKey _yoloKey = GlobalKey();
   bool _logging = false;         // 선택
   double _uiFps = 0.0;
   double _engineFps = 0.0;
@@ -53,6 +64,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   late final Ticker _uiTicker;
   int _uiFrameCount = 0;
   DateTime _lastUiFpsTs = DateTime.now();
+  DateTime? _lastEnqueueAt;
+  static const Duration _minEnqueueInterval = Duration(seconds: 2);
+  static const int _maxQueueItems = 1000; // PNG count upper bound
+  static const double _maxQueueMB = 500.0; // total size upper bound
   
   // FPS 히스토리 (최근 10개 프레임)
   final List<double> _fpsHistory = [];
@@ -62,6 +77,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   List<YOLOResult> _lastSegResults = [];
   Map<String, dynamic>? _lastImu;
   Timer? _imuTicker;
+  Timer? _syncTimer; // offline 큐 동기화 타이머
+
+  // YOLOView 인스턴스 캐시
+  Widget? _yoloView;
 
   // One-time debug dump flag (replaces the invalid local static var)
   bool _dumpedFirstResult = false;
@@ -215,6 +234,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     super.initState();
     debugPrint("🚀 CameraInferenceScreen initState called");
     debugPrint("🚀 YOLOViewController created: $_yoloController");
+
+    // Request location permission at startup
+    _requestLocationPermission();
+
     _imu.start();
     // 🔄 IMU overlay updater (independent of YOLO onResult)
     _imuTicker = Timer.periodic(const Duration(milliseconds: 150), (_) {
@@ -230,6 +253,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                 "gyro": {"x": s.gx, "y": s.gy, "z": s.gz},
                 "lin_acc": {"x": s.lax, "y": s.lay, "z": s.laz},
               };
+        // Call IMU check/send after updating _lastImu
+        _checkImuAndSend();
       });
       if (_logging && _lastImu != null) {
         final nowUs2 = DateTime.now().microsecondsSinceEpoch;
@@ -277,6 +302,14 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       }
     });
     _uiTicker.start();
+    // Offline queue sync timer (주기적 재시도) with small random jitter
+    final delay = Duration(seconds: math.Random().nextInt(5));
+    Future.delayed(delay, () {
+      _syncTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+        _trySyncPending();
+      });
+      _trySyncPending(); // first attempt after jitter
+    });
     // 선택: 로깅 켜고 싶으면
     _logging = true;
     _log.openJsonl('run_log.jsonl');
@@ -288,7 +321,54 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       "note": "startup marker"
     });
     _lastDetLogUs = tUs0;
-    _loadModel(); // detect 모델 하나만 로드
+    _loadModel().then((_) {
+      // Only create YOLOView after model is loaded
+      if (mounted && _modelPath != null && _yoloView == null) {
+        setState(() {
+          _yoloView = YOLOView(
+            controller: _yoloController,
+            modelPath: _modelPath!,
+            task: YOLOTask.segment, // or detect depending on model
+            onResult: (results) {
+              final nowUs = DateTime.now().microsecondsSinceEpoch;
+              final imu = _imu.closest(nowUs);
+
+              _log.write({
+                "t_us": nowUs,
+                "event": "on_result_raw",
+                "result_count": results.length,
+                "imu": imu == null
+                    ? null
+                    : {
+                        "t_us": imu.tUs,
+                        "acc": {"x": imu.ax, "y": imu.ay, "z": imu.az},
+                        "gyro": {"x": imu.gx, "y": imu.gy, "z": imu.gz},
+                        "lin_acc": {"x": imu.lax, "y": imu.lay, "z": imu.laz},
+                      },
+              });
+
+              debugPrint("🎯 YOLOView onResult fired (raw) with ${results.length} results");
+              _onDetectionResults(results);
+            },
+            onPerformanceMetrics: (metrics) {
+              final val = (metrics.fps.isFinite && metrics.fps > 0) ? metrics.fps : 0.0;
+              setState(() {
+                _engineFps = val;
+                _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
+              });
+              if (_logging) {
+                _log.write({
+                  "t_us": DateTime.now().microsecondsSinceEpoch,
+                  "event": "perf",
+                  "source": "engine",
+                  "engine_fps": val
+                });
+              }
+            },
+          );
+        });
+      }
+    });
   }
 
   @override
@@ -298,13 +378,286 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     _imuTicker?.cancel();
     _imuTicker = null;
     _uiTicker.stop();
-    // _yoloController.dispose();
+    _syncTimer?.cancel();
+    _syncTimer = null;
     super.dispose();
   }
 
   // 필요한 TFLite 파일명만 지정해서 사용하세요.
   // 예시: assets/models/base_model_float16.tflite
   String get _modelFileName => 'base_model_float16.tflite';
+
+  // === Offline upload queue (file-based) ===
+  Future<Directory> _pendingDir() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final d = Directory('${dir.path}/pending_uploads');
+    if (!await d.exists()) {
+      await d.create(recursive: true);
+    }
+    return d;
+  }
+
+  Future<void> _trimQueueIfNeeded() async {
+    try {
+      final dir = await _pendingDir();
+      final files = await dir
+          .list()
+          .where((e) => e is File && (e.path.endsWith('.png') || e.path.endsWith('.json')))
+          .cast<File>()
+          .toList();
+      if (files.isEmpty) return;
+      files.sort((a, b) => a.lastModifiedSync().compareTo(b.lastModifiedSync())); // oldest first
+      final pngCount = files.where((f) => f.path.endsWith('.png')).length;
+      final totalMB = files.fold<int>(0, (acc, f) => acc + f.lengthSync()) / (1024 * 1024);
+      if (pngCount <= _maxQueueItems && totalMB <= _maxQueueMB) return;
+
+      int overItems = (pngCount - _maxQueueItems).clamp(0, pngCount);
+      int deleteBudget = overItems;
+      if (totalMB > _maxQueueMB) {
+        deleteBudget += 50; // heuristic: extra cleanup when size too big
+      }
+      int deleted = 0;
+      for (final f in files) {
+        if (deleted >= deleteBudget) break;
+        try { await f.delete(); deleted++; } catch (_) {}
+      }
+      debugPrint('🧹 Queue trimmed: deleted $deleted files (items=$pngCount, totalMB=${totalMB.toStringAsFixed(1)})');
+    } catch (e) {
+      debugPrint('🧹 Queue trim failed: $e');
+    }
+  }
+
+  Future<File> _policyFile() async {
+    final dir = await _pendingDir();
+    return File('${dir.path}/_policy.json');
+  }
+
+  Future<bool> _loadWifiOnlyPolicy() async {
+    try {
+      final f = await _policyFile();
+      if (await f.exists()) {
+        final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        return (j['wifi_only'] ?? true) == true;
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  Future<bool> _isOnline() async {
+    try {
+      final resp = await http.get(Uri.parse('$kBaseUrl$kHealthPath')).timeout(const Duration(seconds: 2));
+      return resp.statusCode == 200;
+    } catch (_) { return false; }
+  }
+
+  Future<void> _enqueueUpload({required Uint8List pngBytes, required Position pos, required String deviceId, required String trigger}) async {
+    final dir = await _pendingDir();
+    final ts = DateTime.now();
+    final safeTs = ts.toIso8601String().replaceAll(':', '-');
+    final base = 'item_${deviceId}_$safeTs';
+    final imgFile = File('${dir.path}/$base.png');
+    final metaFile = File('${dir.path}/$base.json');
+
+    final meta = {
+      "t_us": ts.microsecondsSinceEpoch,
+      "device_id": deviceId,
+      "gps": {
+        "lat": pos.latitude,
+        "lon": pos.longitude,
+        "accuracy": pos.accuracy,
+        "speed_kmh": ((pos.speed.isNaN || pos.speed.isInfinite) ? 0.0 : pos.speed * 3.6),
+      },
+      "trigger": trigger,
+    };
+
+    await imgFile.writeAsBytes(pngBytes, flush: true);
+    await metaFile.writeAsString(jsonEncode(meta), flush: true);
+    await _trimQueueIfNeeded();
+    debugPrint('📦 Enqueued offline upload: ${imgFile.path}');
+  }
+
+  Future<bool> _trySyncPending() async {
+    try {
+      final wifiOnly = await _loadWifiOnlyPolicy();
+      final online = await _isOnline();
+      if (wifiOnly && !online) {
+        debugPrint('📶 Wi‑Fi only policy active and offline → skip sync');
+        return false;
+      }
+      final dir = await _pendingDir();
+      final entries = await dir.list().toList();
+      final pngs = entries.whereType<File>().where((f) => f.path.endsWith('.png')).toList();
+      int success = 0;
+      for (final png in pngs) {
+        final metaPath = png.path.replaceAll('.png', '.json');
+        final metaFile = File(metaPath);
+        if (!await metaFile.exists()) continue;
+        Map<String, dynamic> meta;
+        try {
+          meta = jsonDecode(await metaFile.readAsString()) as Map<String, dynamic>;
+        } catch (e) {
+          debugPrint('⚠️ Meta parse failed for ${metaFile.path}: $e');
+          continue;
+        }
+        final bytes = await png.readAsBytes();
+
+        if (bytes.length > 20 * 1024 * 1024) {
+          debugPrint('🚫 Skip upload (>20MB): ${png.path}');
+          continue;
+        }
+        final request = http.MultipartRequest('POST', Uri.parse('$kBaseUrl$kInferPath'));
+        final fname = png.uri.pathSegments.last;
+        request.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fname));
+
+        final gps = (meta['gps'] as Map?) ?? {};
+        request.fields['gps_lat'] = (gps['lat'] ?? '').toString();
+        request.fields['gps_lon'] = (gps['lon'] ?? '').toString();
+        request.fields['timestamp'] = DateTime.now().toIso8601String();
+        request.fields['device_id'] = (meta['device_id'] ?? 'unknown').toString();
+
+        try {
+          final resp = await request.send().timeout(const Duration(seconds: 12));
+          String body = '';
+          try { body = await resp.stream.bytesToString(); } catch (_) {}
+          if (resp.statusCode == 200) {
+            success++;
+            try {
+              if (body.isNotEmpty) {
+                final j = jsonDecode(body) as Map<String, dynamic>;
+                final overlayUrl = j['overlay_url'] as String?;
+                if (overlayUrl != null && overlayUrl.isNotEmpty) {
+                  final ovResp = await http.get(Uri.parse(overlayUrl)).timeout(const Duration(seconds: 3));
+                  if (ovResp.statusCode == 200 && ovResp.bodyBytes.isNotEmpty) {
+                    final ovPath = png.path.replaceAll('.png', '_overlay.jpg');
+                    await File(ovPath).writeAsBytes(ovResp.bodyBytes, flush: true);
+                  }
+                }
+              }
+            } catch (_) {}
+            await png.delete();
+            await metaFile.delete();
+          } else if (resp.statusCode == 413) {
+            debugPrint('🚫 413 Payload Too Large');
+          } else if (resp.statusCode == 415) {
+            debugPrint('🚫 415 Unsupported Media Type');
+          } else if (resp.statusCode == 400) {
+            debugPrint('🚫 400 Bad Request: $body');
+          } else {
+            debugPrint('❌ Sync failed (${resp.statusCode}): $body');
+          }
+        } catch (e) {
+          debugPrint('📶 Offline: sync attempt failed for ${png.path}: $e');
+        }
+      }
+      debugPrint('🔁 Sync complete: $success item(s) uploaded');
+      await _trimQueueIfNeeded();
+      return success > 0;
+    } catch (e) {
+      debugPrint('⚠️ Sync error: $e');
+      return false;
+    }
+  }
+
+  Future<void> _checkImuAndSend() async {
+    if (_lastImu == null) return;
+
+    // 먼저 GPS 위치(속도 포함) 가져오기
+    Position? pos;
+    try {
+      pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+    } catch (e) {
+      debugPrint("⚠️ GPS position fetch failed: $e");
+      return;
+    }
+
+    // 속도 체크 (단위: m/s → km/h)
+    double speedKmh = (pos.speed.isNaN || pos.speed.isInfinite) ? 0.0 : pos.speed * 3.6;
+    if (speedKmh < 15.0 || speedKmh > 50.0) {
+      debugPrint("⏩ Skip send: speed $speedKmh km/h not in [15, 50]");
+      return;
+    }
+
+    // IMU zAcc 체크
+    final double zAcc = (_lastImu?["acc"]["z"] as num).toDouble();
+    if (zAcc.abs() < 3.0) {
+      debugPrint("⏩ Skip send: zAcc $zAcc < 3.0");
+      return; // 방지턱 제외
+    }
+
+    try {
+      // 1. 카메라 캡쳐 (null safety + lower pixel ratio)
+      final ctx = _yoloKey.currentContext;
+      if (ctx == null) {
+        debugPrint('⚠️ yoloKey context is null');
+        return;
+      }
+      final boundary = ctx.findRenderObject() as RenderRepaintBoundary?;
+      if (boundary == null) {
+        debugPrint('⚠️ RepaintBoundary not found');
+        return;
+      }
+
+      ui.Image? image;
+      Uint8List pngBytes;
+      int capW = 0, capH = 0;
+      try {
+        image = await boundary.toImage(pixelRatio: 1.5);
+        capW = image.width;
+        capH = image.height;
+        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) {
+          debugPrint('⚠️ Failed to get image bytes');
+          return;
+        }
+        pngBytes = byteData.buffer.asUint8List();
+      } finally {
+        try { image?.dispose(); } catch (_) {}
+      }
+
+      // Downscale to max 1280px (longest side)
+      Uint8List resizedBytes = pngBytes;
+      try {
+        final codec = await ui.instantiateImageCodec(
+          pngBytes,
+          targetWidth: (capW >= capH && capW > 0) ? 1280 : null,
+          targetHeight: (capH > capW && capH > 0) ? 1280 : null,
+        );
+        final fi = await codec.getNextFrame();
+        final rb = await fi.image.toByteData(format: ui.ImageByteFormat.png);
+        if (rb != null) resizedBytes = rb.buffer.asUint8List();
+      } catch (_) {}
+
+      // Upload throttle (min interval)
+      final now = DateTime.now();
+      if (_lastEnqueueAt != null && now.difference(_lastEnqueueAt!) < _minEnqueueInterval) {
+        debugPrint('⏸️ Cooldown: skip enqueue');
+        return;
+      }
+
+      // 3. Device ID 가져오기
+      final deviceInfo = DeviceInfoPlugin();
+      String deviceId = "unknown";
+      if (Platform.isAndroid) {
+        final androidInfo = await deviceInfo.androidInfo;
+        deviceId = androidInfo.id;
+      } else if (Platform.isIOS) {
+        final iosInfo = await deviceInfo.iosInfo;
+        deviceId = iosInfo.identifierForVendor ?? "ios-unknown";
+      }
+
+      // 5. Offline-first: 큐에 저장 후 백그라운드 동기화 시도
+      await _enqueueUpload(
+        pngBytes: resizedBytes,
+        pos: pos,
+        deviceId: deviceId,
+        trigger: 'z_acc_threshold',
+      );
+      _lastEnqueueAt = now;
+      await _trySyncPending();
+    } catch (e) {
+      debugPrint("⚠️ Capture/Upload failed: $e");
+    }
+  }
 
   Future<void> _loadModel() async {
     setState(() {
@@ -333,16 +686,17 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         _loadingMessage = '';
       });
 
-      // 기본 임계치 세팅(극도로 낮은 임계값으로 더 많은 결과 감지)
+      // 기본 임계치 세팅(조금 더 현실적인 값으로 조정)
       _yoloController.setThresholds(
-        confidenceThreshold: 0.01, // 0.1 → 0.01로 극도로 낮춤
-        iouThreshold: 0.1,         // 0.3 → 0.1로 낮춤
-        numItemsThreshold: 1,      // 5 → 1로 낮춤
+        confidenceThreshold: 0.05, // 조금 더 현실적인 값
+        iouThreshold: 0.4,         // 일반적인 기본값
+        numItemsThreshold: 1,
       );
       
       debugPrint("✅ YOLO model loaded successfully: $_modelPath");
-      debugPrint("✅ Thresholds set: conf=0.01, iou=0.1, numItems=1");
-      
+      debugPrint("✅ Thresholds set: conf=0.05, iou=0.4, numItems=1");
+      // YOLOView 생성은 initState에서 처리
+
       // YOLOView 초기화 확인 (매우 긴 대기 시간)
       Future.delayed(const Duration(milliseconds: 5000), () {
         if (mounted) {
@@ -357,7 +711,6 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
           });
         }
       });
-      
       // 5초 후에도 결과가 없으면 경고
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) {
@@ -439,58 +792,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
 
   Map<String, dynamic> _encodeDetection(YOLOResult r) {
     try {
-      final dyn = r as dynamic;
-      debugPrint("🟢 Raw YOLOResult: ${dyn.toString()}");
-      
-      // 기본 정보
-      final result = <String, dynamic>{
+      return {
         "class": r.className ?? "unknown",
         "score": r.confidence ?? 0.0,
       };
-      
-      // bbox 정보 추출
-      try {
-        dynamic bboxSrc = dyn.bbox ?? dyn.rect ?? dyn.box ?? dyn.bounds ?? dyn.rectN ?? dyn.rectNormalized ?? dyn.rectF;
-        final bbox = _encodeBbox(bboxSrc);
-        if (bbox != null) result["bbox"] = bbox;
-      } catch (e) {
-        debugPrint("⚠️ Bbox encoding error: $e");
-      }
-      
-      // polygon 정보 추출
-      try {
-        final poly = _encodePolygon(dyn.polygon ?? dyn.points ?? dyn.polyline ?? dyn.path);
-        if (poly != null) result["polygon"] = poly;
-      } catch (e) {
-        debugPrint("⚠️ Polygon encoding error: $e");
-      }
-      
-      // mask 정보 추출
-      try {
-        final m = dyn.mask;
-        if (m != null) {
-          result["mask_info"] = {
-            "has": true,
-            if (dyn.maskWidth != null) "w": (dyn.maskWidth as num).toInt(),
-            if (dyn.maskHeight != null) "h": (dyn.maskHeight as num).toInt(),
-          };
-        }
-      } catch (e) {
-        debugPrint("⚠️ Mask encoding error: $e");
-      }
-      
-      // 추가 필드들
-      try {
-        if (dyn.classIndex != null) result["class_index"] = (dyn.classIndex as num).toInt();
-        if (dyn.classId != null) result["class_id"] = (dyn.classId as num).toInt();
-      } catch (e) {
-        debugPrint("⚠️ Additional fields encoding error: $e");
-      }
-      
-      return result;
     } catch (e) {
       debugPrint("❌ Detection encoding failed: $e");
-      // 최소한의 정보라도 반환
       return {
         "class": r.className ?? "unknown",
         "score": r.confidence ?? 0.0,
@@ -558,7 +865,19 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     // === YOLO detection 직렬화 ===
     final detections = <Map<String, dynamic>>[];
     debugPrint("🔍 Processing ${results.length} detection results");
-    
+
+    // --- Debug dump of raw YOLOResult objects ---
+    for (int i = 0; i < results.length; i++) {
+      final r = results[i];
+      try {
+        final rawJson = jsonEncode(r as dynamic);
+        debugPrint("🟢 Raw result dump $i: $rawJson");
+      } catch (e) {
+        debugPrint("⚠️ Failed to jsonEncode YOLOResult $i: $e");
+        debugPrint("⚠️ Fallback toString: ${r.toString()}");
+      }
+    }
+
     for (int i = 0; i < results.length; i++) {
       final r = results[i];
       try {
@@ -637,54 +956,28 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   Widget build(BuildContext context) {
     debugPrint("🔄 Building CameraInferenceScreen - modelPath: $_modelPath, isLoading: $_isModelLoading");
     debugPrint("🔄 YOLOView will be built with controller: $_yoloController");
-    
+
     // YOLOView 초기화 상태 확인
     if (_modelPath != null && !_isModelLoading) {
       debugPrint("🔄 YOLOView should be initialized now");
       debugPrint("🔄 YOLOView initialized: $_yoloViewInitialized");
     }
-    
+
     return Scaffold(
       backgroundColor: Colors.black,
-      body: (_modelPath != null && !_isModelLoading)
-          ? Stack(
+      body: OrientationBuilder(
+        builder: (context, orientation) {
+          Widget content;
+          if (_modelPath != null && !_isModelLoading) {
+            content = Stack(
               children: [
                 // 카메라 프리뷰 전체 화면
                 const Positioned.fill(child: SizedBox()),
+                // YOLOView 인스턴스 사용 (초기화된 경우)
                 Positioned.fill(
-                  child: YOLOView(
-                    controller: _yoloController,
-                    modelPath: _modelPath!,
-                    task: YOLOTask.segment, // ✅ 세그멘테이션 모드
-                    onResult: (results) {
-                      debugPrint("🎯 YOLOView onResult called with ${results.length} results");
-                      debugPrint("🎯 Results details: $results");
-                      _onDetectionResults(results);
-                    },
-                    onPerformanceMetrics: (metrics) {
-                      final val = (metrics.fps.isFinite && metrics.fps > 0) ? metrics.fps : 0.0;
-
-                      if (mounted) {
-                        setState(() {
-                          _engineFps = val;
-                          // 엔진값이 유효하면 우선 사용, 아니면 EMA/기존 유지
-                          _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
-                        });
-                      } else {
-                        _engineFps = val;
-                        _currentFps = (val > 0.1) ? val : (_emaFps > 0.1 ? _emaFps : _currentFps);
-                      }
-
-                      // ★ 엔진 FPS를 별도 perf 이벤트로도 저장
-                      if (_logging) {
-                        _log.write({
-                          "t_us": DateTime.now().microsecondsSinceEpoch,
-                          "event": "perf",
-                          "source": "engine",
-                          "engine_fps": val
-                        });
-                      }
-                    },
+                  child: RepaintBoundary(
+                    key: _yoloKey,
+                    child: _yoloView ?? const SizedBox(),
                   ),
                 ),
                 //  세그 폴리곤/마스크를 그리는 오버레이
@@ -718,8 +1011,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                             Text(
                               "FPS: ${(_currentFps > 0.1 ? _currentFps : _uiFps).toStringAsFixed(1)}",
                               style: const TextStyle(
-                                color: Colors.white, 
-                                fontSize: 18, 
+                                color: Colors.white,
+                                fontSize: 18,
                                 fontWeight: FontWeight.bold,
                                 fontFamily: 'monospace',
                               ),
@@ -825,8 +1118,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                   ),
                 ),
               ],
-            )
-          : const Center(
+            );
+          } else {
+            content = const Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -835,7 +1129,43 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                   Text('Loading model...', style: TextStyle(color: Colors.white70)),
                 ],
               ),
-            ),
+            );
+          }
+          // If in landscape, rotate the content so it renders correctly
+          if (orientation == Orientation.landscape) {
+            return RotatedBox(
+              quarterTurns: 1,
+              child: content,
+            );
+          } else {
+            return content;
+          }
+        },
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () async {
+          final dir = await getApplicationDocumentsDirectory();
+          final file = File('${dir.path}/run_log.jsonl');
+          if (await file.exists()) {
+            await file.delete();
+            debugPrint("🗑️ run_log.jsonl deleted");
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('run_log.jsonl deleted')),
+              );
+            }
+          } else {
+            debugPrint("⚠️ run_log.jsonl not found");
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('run_log.jsonl not found')),
+              );
+            }
+          }
+        },
+        backgroundColor: Colors.red,
+        child: const Icon(Icons.delete),
+      ),
     );
   }
 }
@@ -962,22 +1292,59 @@ class LaneOverlayPainter extends CustomPainter {
 
       if (drawn) continue;
 
-      // 2) Mask (placeholder outline) if available
+      // 2) Mask overlay if available
       try {
         final mask = dyn.mask;
-        if (mask != null) {
-          final path = Path();
-          bool started = false;
-          final step = (size.width / 80).clamp(2, 8).toDouble();
-          for (double x = 0; x < size.width; x += step) {
-            final y = size.height * 0.5; // placeholder line; replace with contour when available
-            if (!started) { path.moveTo(x, y); started = true; } else { path.lineTo(x, y); }
+        final mw = (dyn.maskWidth as int?);
+        final mh = (dyn.maskHeight as int?);
+        if (mask != null && mw != null && mh != null && mask is Uint8List) {
+          // Convert binary/prob mask into ImageShader
+          // Since decodeImageFromPixels is async, this block must be adapted for sync paint.
+          // In practice, mask overlays should be pre-decoded to Image and passed in, but for
+          // demonstration, we use instantiateImageCodec for RGBA8888 mask.
+          // WARNING: decodeImageFromPixels is async and can't be used directly here!
+          // So we fallback to drawing a color overlay using alpha mask if available.
+          // If mask is a binary mask (0/1 or 0/255), we can draw pixels manually.
+          final w = mw;
+          final h = mh;
+          final maskBytes = mask;
+          // Try to draw as alpha mask (1 byte per pixel)
+          if (maskBytes.length == w * h) {
+            final imgBytes = Uint8List(w * h * 4);
+            for (int i = 0; i < w * h; i++) {
+              final alpha = maskBytes[i];
+              imgBytes[i * 4 + 0] = color.red;
+              imgBytes[i * 4 + 1] = color.green;
+              imgBytes[i * 4 + 2] = color.blue;
+              imgBytes[i * 4 + 3] = (alpha * 0.3).toInt().clamp(0, 255); // semi-transparent
+            }
+            // ignore: deprecated_member_use
+            final paintImage = Paint()
+              ..filterQuality = FilterQuality.low
+              ..isAntiAlias = false;
+            // decodeImageFromPixels is async, so we cannot call it here synchronously.
+            // Instead, fallback: just paint a translucent rectangle.
+            canvas.drawRect(
+              Rect.fromLTWH(0, 0, size.width, size.height),
+              Paint()
+                ..color = color.withOpacity(0.15)
+                ..style = PaintingStyle.fill,
+            );
+            drawn = true;
+          } else {
+            // Fallback: just paint a translucent rectangle overlay if mask bytes are not expected shape
+            canvas.drawRect(
+              Rect.fromLTWH(0, 0, size.width, size.height),
+              Paint()
+                ..color = color.withOpacity(0.15)
+                ..style = PaintingStyle.fill,
+            );
+            drawn = true;
           }
-          canvas.drawPath(path, outline);
-          canvas.drawPath(path, paint..strokeWidth = (strokeW - 1).clamp(2, 10));
-          drawn = true;
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint("⚠️ Mask paint failed: $e");
+      }
 
       if (drawn) continue;
 
@@ -1028,3 +1395,24 @@ class LaneOverlayPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant LaneOverlayPainter old) => old.results != results;
 }
+  // Location permission request at startup
+  Future<void> _requestLocationPermission() async {
+    debugPrint("📍 Checking location permission...");
+    LocationPermission permission = await Geolocator.checkPermission();
+    debugPrint("📍 Initial location permission status: $permission");
+    if (permission == LocationPermission.denied) {
+      debugPrint("📍 Location permission denied, requesting...");
+      permission = await Geolocator.requestPermission();
+      debugPrint("📍 Requested location permission, new status: $permission");
+    }
+    if (permission == LocationPermission.deniedForever) {
+      debugPrint("📍 Location permission denied forever. Opening app settings...");
+      await Geolocator.openAppSettings();
+      // Optionally, you can show a dialog/snackbar here
+    }
+    if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
+      debugPrint("📍 Location permission granted: $permission");
+    } else {
+      debugPrint("📍 Location permission NOT granted: $permission");
+    }
+  }

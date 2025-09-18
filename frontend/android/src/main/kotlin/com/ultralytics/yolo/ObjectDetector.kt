@@ -367,7 +367,7 @@ class ObjectDetector(
                     rect.right <= origWidth && rect.bottom <= origHeight &&
                     rect.width() > 0 && rect.height() > 0) {
                     
-                    val classIdx = boxArray[5].toInt()
+                    val classIdx = (boxArray[5] as? Number)?.toInt() ?: -1
                     val label = if (classIdx in labels.indices) labels[classIdx] else "Unknown"
                     boxes.add(Box(classIdx, label, boxArray[4], rect, normRect))
                 }
