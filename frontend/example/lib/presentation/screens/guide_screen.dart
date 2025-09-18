@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:ui';
+import 'package:permission_handler/permission_handler.dart';
 
 class GuideScreen extends StatefulWidget {
   const GuideScreen({Key? key}) : super(key: key);
@@ -47,10 +48,54 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
     super.dispose();
   }
 
+  Future<bool> _ensureCameraPermission() async {
+    var status = await Permission.camera.status;
+    if (status.isGranted) return true;
+
+    // 안내 다이얼로그 (요청 전 사전 설명)
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('카메라 권한 요청'),
+        content: const Text('실시간 감지를 위해 카메라 권한이 필요합니다.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('확인')),
+        ],
+      ),
+    );
+
+    status = await Permission.camera.request();
+    if (status.isGranted) return true;
+
+    if (status.isPermanentlyDenied) {
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('권한이 비활성화됨'),
+          content: const Text('설정 > 앱 권한에서 카메라 권한을 허용해 주세요.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('취소')),
+            TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('설정 열기')),
+          ],
+        ),
+      );
+      if (go == true) {
+        await openAppSettings();
+      }
+    }
+    return false;
+  }
+
   Widget _buildGlassmorphicButton(BuildContext context) {
     return GestureDetector(
-      onTap: () {
-        Navigator.pushNamed(context, '/camera');
+      onTap: () async {
+        final ok = await _ensureCameraPermission();
+        if (!ok) return;
+        Navigator.pushNamed(
+          context,
+          '/camera',
+          arguments: const {'autoStart': true},
+        );
       },
       child: ClipRRect(
         borderRadius: BorderRadius.circular(40),
@@ -90,6 +135,8 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
 
   @override
   Widget build(BuildContext context) {
+    // NOTE: 카메라 권한은 가이드 화면에서 시작 버튼을 통해 획득(카메라 화면 autoStart)
+    // 위치 권한은 앱 시작 시(스플래시/루트)에서만 요청
     return Scaffold(
       body: Stack(
         children: [
