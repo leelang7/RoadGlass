@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:convert'; // add at top
 import 'dart:ui' as ui;
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart'; // for MediaType
 import 'package:geolocator/geolocator.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
@@ -84,6 +85,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
 
   // 카메라 자동 시작 제어 (가이드 화면에서 권한 받은 뒤 autoStart=true로 진입하면 바로 시작)
   bool _cameraReady = false;
+  // Overlay suppression flag for clean capture
+  bool _suppressOverlayForCapture = false;
+  bool _hideYoloForCapture = false; // YOLOView를 일시적으로 제거해 순수 카메라만 캡쳐
 
   // One-time debug dump flag (replaces the invalid local static var)
   bool _dumpedFirstResult = false;
@@ -409,6 +413,163 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     return d;
   }
 
+  // === Captures directory for manual screenshot saving ===
+  Future<Directory> _capturesDir() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final d = Directory('${dir.path}/captures');
+    if (!await d.exists()) {
+      await d.create(recursive: true);
+    }
+    return d;
+  }
+
+  // === Manual snapshot capture ===
+  Future<void> _captureFrameToFile() async {
+    try {
+      if (!_cameraReady || _yoloKey.currentContext == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('카메라가 아직 시작되지 않았습니다.')),
+          );
+        }
+        return;
+      }
+
+      // Temporarily hide overlays so captured image contains only camera frame (no seg)
+      if (mounted) {
+        setState(() { _suppressOverlayForCapture = true; });
+        await Future.delayed(const Duration(milliseconds: 16));
+      }
+      // YOLOView 자체를 잠시 제거하여 순수 카메라만 렌더되게 함
+      if (mounted) {
+        setState(() { _hideYoloForCapture = true; });
+        // 프레임이 실제 반영되도록 한 프레임 대기
+        await WidgetsBinding.instance.endOfFrame;
+        // 저성능 단말 대비 한 프레임 더 여유
+        await Future.delayed(const Duration(milliseconds: 16));
+      }
+
+      ui.Image? image;
+      Uint8List pngBytes;
+      int capW = 0, capH = 0;
+      try {
+        final boundary = _yoloKey.currentContext!.findRenderObject() as RenderRepaintBoundary?;
+        if (boundary == null) {
+          debugPrint('⚠️ RepaintBoundary not found for capture');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (boundary).')),
+            );
+          }
+          return;
+        }
+        image = await boundary.toImage(pixelRatio: 1.5);
+        capW = image.width;
+        capH = image.height;
+        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (bytes).')),
+            );
+          }
+          return;
+        }
+        pngBytes = byteData.buffer.asUint8List();
+      } finally {
+        try { image?.dispose(); } catch (_) {}
+        if (mounted) {
+          setState(() { _suppressOverlayForCapture = false; });
+        } else {
+          _suppressOverlayForCapture = false;
+        }
+        if (mounted) {
+          setState(() { _hideYoloForCapture = false; });
+          await WidgetsBinding.instance.endOfFrame;
+        } else {
+          _hideYoloForCapture = false;
+        }
+      }
+
+      // Downscale to max 1280px (longest side)
+      Uint8List resizedBytes = pngBytes;
+      try {
+        final codec = await ui.instantiateImageCodec(
+          pngBytes,
+          targetWidth: (capW >= capH && capW > 0) ? 1280 : null,
+          targetHeight: (capH > capW && capH > 0) ? 1280 : null,
+        );
+        final fi = await codec.getNextFrame();
+        final rb = await fi.image.toByteData(format: ui.ImageByteFormat.png);
+        if (rb != null) resizedBytes = rb.buffer.asUint8List();
+      } catch (e) {
+        debugPrint('ℹ️ Capture downscale skipped: $e');
+      }
+
+      final dir = await _capturesDir();
+      final ts = DateTime.now().toIso8601String().replaceAll(':', '-');
+      final file = File('${dir.path}/capture_$ts.png');
+      await file.writeAsBytes(resizedBytes, flush: true);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('캡쳐 저장됨: ${file.path}')),
+        );
+      }
+
+      // === Manual capture → unconditional enqueue & sync ===
+      final perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
+        debugPrint("📍 Location permission not granted (manual capture skip upload)");
+        return;
+      }
+
+      // Fetch current GPS (ignore speed/IMU/cooldown)
+      Position? pos;
+      try {
+        pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+      } catch (e) {
+        debugPrint("⚠️ GPS position fetch failed (manual): $e");
+        return;
+      }
+
+      // Device ID
+      final deviceInfo = DeviceInfoPlugin();
+      String deviceId = 'unknown';
+      if (Platform.isAndroid) {
+        final androidInfo = await deviceInfo.androidInfo;
+        deviceId = androidInfo.id;
+      } else if (Platform.isIOS) {
+        final iosInfo = await deviceInfo.iosInfo;
+        deviceId = iosInfo.identifierForVendor ?? 'ios-unknown';
+      }
+
+      // 6) Enqueue upload with same pipeline (trigger marked as manual)
+      await _enqueueUpload(
+        pngBytes: resizedBytes,
+        pos: pos,
+        deviceId: deviceId,
+        trigger: 'manual_capture',
+      );
+      _lastEnqueueAt = DateTime.now();
+
+      // 7) Try immediate sync (respects Wi‑Fi policy and online status)
+      final syncSuccess = await _trySyncPending();
+      if (!syncSuccess && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('수동 캡쳐가 업로드 큐에 추가되었습니다. 네트워크 연결 시 전송됩니다.')),
+        );
+      }
+    } catch (e) {
+      debugPrint('❌ Manual capture failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('캡쳐 중 오류가 발생했습니다.')),
+        );
+      }
+    }
+  }
+
   Future<void> _trimQueueIfNeeded() async {
     try {
       final dir = await _pendingDir();
@@ -519,18 +680,30 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         }
         final request = http.MultipartRequest('POST', Uri.parse('$kBaseUrl$kInferPath'));
         final fname = png.uri.pathSegments.last;
-        request.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fname));
+        request.files.add(
+          http.MultipartFile.fromBytes(
+            'file',
+            bytes,
+            filename: fname,
+            contentType: MediaType('image', 'png'),
+          ),
+        );
 
+        // Send both: meta JSON (legacy) + explicit fields (newer)
         final gps = (meta['gps'] as Map?) ?? {};
+        request.fields['meta'] = jsonEncode(meta);
         request.fields['gps_lat'] = (gps['lat'] ?? '').toString();
         request.fields['gps_lon'] = (gps['lon'] ?? '').toString();
         request.fields['timestamp'] = DateTime.now().toIso8601String();
         request.fields['device_id'] = (meta['device_id'] ?? 'unknown').toString();
 
+        String shortBody = '';
         try {
           final resp = await request.send().timeout(const Duration(seconds: 12));
           String body = '';
           try { body = await resp.stream.bytesToString(); } catch (_) {}
+          shortBody = body.length > 140 ? body.substring(0, 140) + '…' : body;
+
           if (resp.statusCode == 200) {
             success++;
             try {
@@ -548,14 +721,19 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
             } catch (_) {}
             await png.delete();
             await metaFile.delete();
-          } else if (resp.statusCode == 413) {
-            debugPrint('🚫 413 Payload Too Large');
-          } else if (resp.statusCode == 415) {
-            debugPrint('🚫 415 Unsupported Media Type');
-          } else if (resp.statusCode == 400) {
-            debugPrint('🚫 400 Bad Request: $body');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('업로드 성공 (200): $fname')),
+              );
+            }
           } else {
-            debugPrint('❌ Sync failed (${resp.statusCode}): $body');
+            final code = resp.statusCode;
+            debugPrint('❌ Sync failed ($code): $shortBody');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('업로드 실패 ($code): ${shortBody.isEmpty ? '응답 없음' : shortBody}')),
+              );
+            }
           }
         } catch (e) {
           debugPrint('📶 Offline: sync attempt failed for ${png.path}: $e');
@@ -1004,14 +1182,18 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                       Positioned.fill(
                         child: RepaintBoundary(
                           key: _yoloKey,
-                          child: _yoloView ?? const SizedBox(),
+                          child: _hideYoloForCapture
+                              ? const SizedBox()
+                              : (_yoloView ?? const SizedBox()),
                         ),
                       ),
                       //  세그 폴리곤/마스크를 그리는 오버레이
                       Positioned.fill(
                         child: IgnorePointer(
                           child: CustomPaint(
-                            painter: LaneOverlayPainter(results: _lastSegResults),
+                            painter: LaneOverlayPainter(
+                              results: _suppressOverlayForCapture ? const <YOLOResult>[] : _lastSegResults,
+                            ),
                           ),
                         ),
                       ),
@@ -1199,29 +1381,45 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
           }
         },
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () async {
-          final dir = await getApplicationDocumentsDirectory();
-          final file = File('${dir.path}/run_log.jsonl');
-          if (await file.exists()) {
-            await file.delete();
-            debugPrint("🗑️ run_log.jsonl deleted");
-            if (context.mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('run_log.jsonl deleted')),
-              );
-            }
-          } else {
-            debugPrint("⚠️ run_log.jsonl not found");
-            if (context.mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('run_log.jsonl not found')),
-              );
-            }
-          }
-        },
-        backgroundColor: Colors.red,
-        child: const Icon(Icons.delete),
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          // Capture button (위치: 삭제 버튼 바로 위)
+          FloatingActionButton(
+            heroTag: 'fab_capture',
+            onPressed: _captureFrameToFile,
+            backgroundColor: Colors.blueAccent,
+            child: const Icon(Icons.camera_alt_rounded),
+          ),
+          const SizedBox(height: 12),
+          // Delete button (기존)
+          FloatingActionButton(
+            heroTag: 'fab_delete',
+            onPressed: () async {
+              final dir = await getApplicationDocumentsDirectory();
+              final file = File('${dir.path}/run_log.jsonl');
+              if (await file.exists()) {
+                await file.delete();
+                debugPrint("🗑️ run_log.jsonl deleted");
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('run_log.jsonl deleted')),
+                  );
+                }
+              } else {
+                debugPrint("⚠️ run_log.jsonl not found");
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('run_log.jsonl not found')),
+                  );
+                }
+              }
+            },
+            backgroundColor: Colors.red,
+            child: const Icon(Icons.delete),
+          ),
+        ],
       ),
     );
   }
