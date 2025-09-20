@@ -87,7 +87,6 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   bool _cameraReady = false;
   // Overlay suppression flag for clean capture
   bool _suppressOverlayForCapture = false;
-  bool _hideYoloForCapture = false; // YOLOView를 일시적으로 제거해 순수 카메라만 캡쳐
 
   // One-time debug dump flag (replaces the invalid local static var)
   bool _dumpedFirstResult = false;
@@ -347,6 +346,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
           controller: _yoloController,
           modelPath: _modelPath!,
           task: YOLOTask.segment,
+          showNativeUI: false, // 🔕 YOLOView 내부 오버레이 비활성화 → 캡쳐 시 카메라 원본만 포함
           onResult: (results) {
             final nowUs = DateTime.now().microsecondsSinceEpoch;
             final imu = _imu.closest(nowUs);
@@ -440,14 +440,8 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         setState(() { _suppressOverlayForCapture = true; });
         await Future.delayed(const Duration(milliseconds: 16));
       }
-      // YOLOView 자체를 잠시 제거하여 순수 카메라만 렌더되게 함
-      if (mounted) {
-        setState(() { _hideYoloForCapture = true; });
-        // 프레임이 실제 반영되도록 한 프레임 대기
-        await WidgetsBinding.instance.endOfFrame;
-        // 저성능 단말 대비 한 프레임 더 여유
-        await Future.delayed(const Duration(milliseconds: 16));
-      }
+      // Ensure a full frame is rendered without overlay before capture
+      await WidgetsBinding.instance.endOfFrame;
 
       ui.Image? image;
       Uint8List pngBytes;
@@ -480,14 +474,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         try { image?.dispose(); } catch (_) {}
         if (mounted) {
           setState(() { _suppressOverlayForCapture = false; });
+          // (optional) let UI settle
+          // await WidgetsBinding.instance.endOfFrame;
         } else {
           _suppressOverlayForCapture = false;
-        }
-        if (mounted) {
-          setState(() { _hideYoloForCapture = false; });
-          await WidgetsBinding.instance.endOfFrame;
-        } else {
-          _hideYoloForCapture = false;
         }
       }
 
@@ -1182,9 +1172,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                       Positioned.fill(
                         child: RepaintBoundary(
                           key: _yoloKey,
-                          child: _hideYoloForCapture
-                              ? const SizedBox()
-                              : (_yoloView ?? const SizedBox()),
+                          child: _yoloView ?? const SizedBox(),
                         ),
                       ),
                       //  세그 폴리곤/마스크를 그리는 오버레이
