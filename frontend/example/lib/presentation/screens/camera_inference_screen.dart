@@ -8,16 +8,42 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart'; // for MediaType
 import 'package:geolocator/geolocator.dart';
 import 'package:device_info_plus/device_info_plus.dart';
+// import 'package:gallery_saver/gallery_saver.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:ultralytics_yolo/yolo.dart';
 import 'package:ultralytics_yolo/yolo_result.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
 import '../../services/imu_manager.dart';
 import '../../services/log_writer.dart'; 
+
+/// Shim for ImageGallerySaver API bridged to native MethodChannel.
+class ImageGallerySaver {
+  static const MethodChannel _channel = MethodChannel('app.gallery_saver');
+
+  static Future<Map<String, dynamic>> saveImage(
+    Uint8List bytes, {
+    int quality = 100, // kept for compatibility
+    String? name,
+  }) async {
+    // Write bytes to a temp file, then hand off to native for gallery insert
+    final dir = await getTemporaryDirectory();
+    final base = (name ?? 'capture_${DateTime.now().millisecondsSinceEpoch}')
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final hasExt = base.endsWith('.png') || base.endsWith('.jpg') || base.endsWith('.jpeg');
+    final file = File('${dir.path}/${hasExt ? base : '$base.png'}');
+    await file.writeAsBytes(bytes, flush: true);
+
+    final res = await _channel.invokeMethod<dynamic>('saveImage', {'path': file.path});
+    if (res is Map) {
+      return res.map((k, v) => MapEntry(k.toString(), v));
+    }
+    return {'isSuccess': res == true, 'filePath': file.path};
+  }
+}
 
 // (프로젝트에 이미 있다면 유지) 모델 타입 커스텀 enum을 쓰지 않고 detect 고정으로 갑니다.
 // import '../../models/model_type.dart';  // ❌ 불필요
@@ -401,7 +427,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
 
   // 필요한 TFLite 파일명만 지정해서 사용하세요.
   // 예시: assets/models/base_model_float16.tflite
-  String get _modelFileName => 'base_model_float16.tflite';
+  String get _modelFileName => 'best_float16.tflite';
 
   // === Offline upload queue (file-based) ===
   Future<Directory> _pendingDir() async {
@@ -501,9 +527,17 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       final file = File('${dir.path}/capture_$ts.png');
       await file.writeAsBytes(resizedBytes, flush: true);
 
+      // ▶ 갤러리에도 저장
+      final result = await ImageGallerySaver.saveImage(
+        resizedBytes,
+        quality: 100,
+        name: "roadglass_${DateTime.now().millisecondsSinceEpoch}",
+      );
+      // 저장 성공 피드백 (선택)
       if (mounted) {
+        final ok = (result is Map && (result['isSuccess'] == true || result['filePath'] != null));
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('캡쳐 저장됨: ${file.path}')),
+          SnackBar(content: Text(ok ? '📸 갤러리에 저장됨' : '❌ 갤러리 저장 실패')),
         );
       }
 
@@ -1638,4 +1672,3 @@ class LaneOverlayPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant LaneOverlayPainter old) => old.results != results;
 }
-  // Location permission request at startup (이전 위치 권한 요청 함수, 더 이상 사용하지 않음)
