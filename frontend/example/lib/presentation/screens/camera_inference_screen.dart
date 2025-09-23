@@ -45,6 +45,24 @@ class ImageGallerySaver {
   }
 }
 
+/// Shim for native "pure camera frame" capture (no overlays).
+class NativeCameraCapture {
+  static const MethodChannel _channel = MethodChannel('app.camera_capture');
+
+  /// Returns raw PNG/JPEG bytes from native camera preview without any Flutter overlays.
+  static Future<Uint8List?> captureBytes() async {
+    try {
+      final res = await _channel.invokeMethod<dynamic>('capture');
+      if (res is Uint8List) return res;
+      if (res is Map && res['bytes'] is Uint8List) return res['bytes'] as Uint8List;
+      if (res is List) return Uint8List.fromList(res.cast<int>());
+    } catch (e) {
+      debugPrint('⚠️ NativeCameraCapture.captureBytes failed: $e');
+    }
+    return null;
+  }
+}
+
 // (프로젝트에 이미 있다면 유지) 모델 타입 커스텀 enum을 쓰지 않고 detect 고정으로 갑니다.
 // import '../../models/model_type.dart';  // ❌ 불필요
 
@@ -461,50 +479,81 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
         return;
       }
 
-      // Temporarily hide overlays so captured image contains only camera frame (no seg)
-      if (mounted) {
-        setState(() { _suppressOverlayForCapture = true; });
-        await Future.delayed(const Duration(milliseconds: 16));
-      }
-      // Ensure a full frame is rendered without overlay before capture
-      await WidgetsBinding.instance.endOfFrame;
-
-      ui.Image? image;
-      Uint8List pngBytes;
+      // 1) Try native capture (pure camera bytes) first
+      Uint8List? pngBytes;
       int capW = 0, capH = 0;
+
       try {
-        final boundary = _yoloKey.currentContext!.findRenderObject() as RenderRepaintBoundary?;
-        if (boundary == null) {
-          debugPrint('⚠️ RepaintBoundary not found for capture');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (boundary).')),
-            );
-          }
-          return;
+        final native = await NativeCameraCapture.captureBytes();
+        if (native != null && native.isNotEmpty) {
+          pngBytes = native;
+          // We'll fill capW/capH after decoding below if needed
         }
-        image = await boundary.toImage(pixelRatio: 1.5);
-        capW = image.width;
-        capH = image.height;
-        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-        if (byteData == null) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (bytes).')),
-            );
-          }
-          return;
-        }
-        pngBytes = byteData.buffer.asUint8List();
-      } finally {
-        try { image?.dispose(); } catch (_) {}
+      } catch (e) {
+        debugPrint('ℹ️ Native capture not available: $e');
+      }
+
+      // 2) Fallback: Flutter screenshot of YOLOView (overlays suppressed)
+      if (pngBytes == null) {
         if (mounted) {
-          setState(() { _suppressOverlayForCapture = false; });
-          // (optional) let UI settle
-          // await WidgetsBinding.instance.endOfFrame;
-        } else {
-          _suppressOverlayForCapture = false;
+          setState(() { _suppressOverlayForCapture = true; });
         }
+        await WidgetsBinding.instance.endOfFrame;
+        await Future.delayed(const Duration(milliseconds: 16));
+        await WidgetsBinding.instance.endOfFrame;
+
+        ui.Image? image;
+        try {
+          final boundary = _yoloKey.currentContext!.findRenderObject() as RenderRepaintBoundary?;
+          if (boundary == null) {
+            debugPrint('⚠️ RepaintBoundary not found for capture');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (boundary).')),
+              );
+            }
+            return;
+          }
+          image = await boundary.toImage(pixelRatio: 1.5);
+          capW = image.width;
+          capH = image.height;
+          final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+          if (byteData == null) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (bytes).')),
+              );
+            }
+            return;
+          }
+          pngBytes = byteData.buffer.asUint8List();
+        } finally {
+          try { image?.dispose(); } catch (_) {}
+          if (mounted) {
+            setState(() { _suppressOverlayForCapture = false; });
+          } else {
+            _suppressOverlayForCapture = false;
+          }
+        }
+      }
+      if (pngBytes == null) {
+        // Should not happen, but guard anyway
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('캡쳐 실패: 이미지 바이트가 비어있습니다.')),
+          );
+        }
+        return;
+      }
+
+      if ((capW == 0 || capH == 0)) {
+        try {
+          final codecProbe = await ui.instantiateImageCodec(pngBytes);
+          final fiProbe = await codecProbe.getNextFrame();
+          capW = fiProbe.image.width;
+          capH = fiProbe.image.height;
+          fiProbe.image.dispose();
+        } catch (_) {}
       }
 
       // Downscale to max 1280px (longest side)
@@ -805,33 +854,50 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     }
 
     try {
-      // 1. 카메라 캡쳐 (null safety + lower pixel ratio)
-      final ctx = _yoloKey.currentContext;
-      if (ctx == null) {
-        debugPrint('⚠️ yoloKey context is null');
-        return;
-      }
-      final boundary = ctx.findRenderObject() as RenderRepaintBoundary?;
-      if (boundary == null) {
-        debugPrint('⚠️ RepaintBoundary not found');
-        return;
+      // 1. 카메라 캡쳐 (native 우선)
+      Uint8List? pngBytes;
+      int capW = 0, capH = 0;
+
+      try {
+        final native = await NativeCameraCapture.captureBytes();
+        if (native != null && native.isNotEmpty) {
+          pngBytes = native;
+        }
+      } catch (e) {
+        debugPrint('ℹ️ Native capture not available (IMU path): $e');
       }
 
-      ui.Image? image;
-      Uint8List pngBytes;
-      int capW = 0, capH = 0;
-      try {
-        image = await boundary.toImage(pixelRatio: 1.5);
-        capW = image.width;
-        capH = image.height;
-        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-        if (byteData == null) {
-          debugPrint('⚠️ Failed to get image bytes');
+      // Fallback to Flutter screenshot when native capture not available
+      if (pngBytes == null) {
+        final ctx = _yoloKey.currentContext;
+        if (ctx == null) {
+          debugPrint('⚠️ yoloKey context is null');
           return;
         }
-        pngBytes = byteData.buffer.asUint8List();
-      } finally {
-        try { image?.dispose(); } catch (_) {}
+        final boundary = ctx.findRenderObject() as RenderRepaintBoundary?;
+        if (boundary == null) {
+          debugPrint('⚠️ RepaintBoundary not found');
+          return;
+        }
+        ui.Image? image;
+        try {
+          image = await boundary.toImage(pixelRatio: 1.5);
+          capW = image.width;
+          capH = image.height;
+          final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+          if (byteData == null) {
+            debugPrint('⚠️ Failed to get image bytes');
+            return;
+          }
+          pngBytes = byteData.buffer.asUint8List();
+        } finally {
+          try { image?.dispose(); } catch (_) {}
+        }
+      }
+
+      if (pngBytes == null) {
+        debugPrint('⚠️ Capture returned null bytes');
+        return;
       }
 
       // Downscale to max 1280px (longest side)
@@ -1211,10 +1277,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                       ),
                       //  세그 폴리곤/마스크를 그리는 오버레이
                       Positioned.fill(
-                        child: IgnorePointer(
-                          child: CustomPaint(
-                            painter: LaneOverlayPainter(
-                              results: _suppressOverlayForCapture ? const <YOLOResult>[] : _lastSegResults,
+                        child: Visibility(
+                          visible: !_suppressOverlayForCapture,
+                          maintainState: true,
+                          child: IgnorePointer(
+                            child: CustomPaint(
+                              painter: LaneOverlayPainter(results: _lastSegResults),
                             ),
                           ),
                         ),

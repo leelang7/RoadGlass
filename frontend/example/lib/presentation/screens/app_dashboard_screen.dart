@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 import 'package:path_provider/path_provider.dart';
 
 class AppDashboardScreen extends StatefulWidget {
@@ -21,6 +22,238 @@ class _AppDashboardScreenState extends State<AppDashboardScreen> {
   DateTime? _lastSyncAt;
   bool _online = false;
   bool _syncing = false;
+  // ====== 추가: 업로드 큐/수동전송/비우기 관련 헬퍼 ======
+  Future<List<File>> _listPendingPngs() async {
+    final dir = await _pendingDir();
+    if (!await dir.exists()) return [];
+    final entries = await dir.list().toList();
+    return entries.whereType<File>().where((f) => f.path.endsWith('.png')).toList();
+  }
+
+  Future<void> _clearQueueConfirm() async {
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('대기 큐 비우기'),
+        content: const Text('대기 중인 이미지/메타 파일을 모두 삭제할까요? 이 작업은 되돌릴 수 없습니다.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('취소')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('삭제')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      final dir = await _pendingDir();
+      if (await dir.exists()) {
+        final entries = await dir.list().toList();
+        for (final e in entries) {
+          if (e is File && (e.path.endsWith('.png') || e.path.endsWith('.json'))) {
+            try { await e.delete(); } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    await _scanQueue();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _sendPending({List<File>? only}) async {
+    if (_syncing) return;
+    if (_wifiOnly == true && !_online) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('오프라인 상태입니다. Wi‑Fi 연결 후 다시 시도하세요.'), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+    setState(() { _syncing = true; });
+    int success = 0, skipped = 0, failed = 0;
+    try {
+      final pngs = only ?? await _listPendingPngs();
+      for (final png in pngs) {
+        final metaPath = png.path.replaceAll('.png', '.json');
+        final metaFile = File(metaPath);
+        if (!await metaFile.exists()) { skipped++; continue; }
+
+        Map<String, dynamic> meta;
+        try {
+          meta = jsonDecode(await metaFile.readAsString()) as Map<String, dynamic>;
+        } catch (_) { failed++; continue; }
+
+        final gps = (meta['gps'] as Map?) ?? const {};
+        final lat = (gps['lat'] as num?)?.toDouble();
+        final lon = (gps['lon'] as num?)?.toDouble();
+        // 필수 메타 유효성: 위/경도 없으면 전송 스킵
+        if (lat == null || lon == null) { skipped++; continue; }
+
+        final bytes = await png.readAsBytes();
+        final req = http.MultipartRequest('POST', Uri.parse(_endpoint));
+        final lower = png.path.toLowerCase();
+        final isPng = lower.endsWith('.png');
+        final fname = png.uri.pathSegments.last; // 확장자 변경하지 않음
+        final mediaType = isPng ? MediaType('image', 'png') : MediaType('image', 'jpeg');
+        req.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fname, contentType: mediaType));
+        req.headers['Accept'] = 'application/json';
+        req.fields['gps_lat']   = lat.toString();
+        req.fields['gps_lon']   = lon.toString();
+        req.fields['timestamp'] = DateTime.now().toIso8601String();
+        req.fields['device_id'] = (meta['device_id'] ?? 'unknown').toString();
+        // 백엔드 기본 파라미터(서버 기본과 동일하게)
+        req.fields['conf']      = (meta['conf'] ?? 0.25).toString();
+        req.fields['iou']       = (meta['iou']  ?? 0.50).toString();
+        req.fields['max_size']  = (meta['max_size'] ?? 1280).toString();
+
+        try {
+          final streamed = await req.send();
+          final resp = await http.Response.fromStream(streamed);
+          if (resp.statusCode == 200) {
+            success++;
+            try { await png.delete(); } catch (_) {}
+            try { await metaFile.delete(); } catch (_) {}
+          } else {
+            failed++;
+            debugPrint('Upload failed (${resp.statusCode}) for ${png.path}: ${resp.body}');
+          }
+        } catch (e) {
+          failed++;
+          debugPrint('send error for ${png.path}: $e');
+        }
+      }
+
+      if (success > 0) {
+        await _writeLastSyncNow();
+      }
+
+      if (!mounted) return;
+      final msg = '업로드 완료: 성공 $success · 실패 $failed · 스킵 $skipped';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
+      );
+    } catch (e) {
+      debugPrint('sendPending error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('업로드 오류: $e'), duration: const Duration(seconds: 3)),
+        );
+      }
+    } finally {
+      await _scanQueue();
+      await _pingOnline();
+      if (mounted) setState(() { _syncing = false; });
+    }
+  }
+
+  Future<void> _openManualSendSheet() async {
+    final pngs = await _listPendingPngs();
+    if (!mounted) return;
+    if (pngs.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('보낼 항목이 없습니다.'), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
+    final selected = <String, bool>{ for (final f in pngs) f.path : true };
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setS) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(child: Text('선택 업로드', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700))),
+                      TextButton(
+                        onPressed: () { setS(() { for (final k in selected.keys) { selected[k] = true; } }); },
+                        child: const Text('전체선택'),
+                      ),
+                      TextButton(
+                        onPressed: () { setS(() { for (final k in selected.keys) { selected[k] = false; } }); },
+                        child: const Text('해제'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Flexible(
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: pngs.length,
+                      itemBuilder: (c, i) {
+                        final f = pngs[i];
+                        final name = f.uri.pathSegments.last;
+                        return FutureBuilder<int>(
+                          future: f.length(),
+                          builder: (c, snap) {
+                            final sz = snap.data ?? 0;
+                            final mb = (sz / (1024 * 1024)).toStringAsFixed(2);
+                            final checked = selected[f.path] == true;
+                            return ListTile(
+                              contentPadding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+                              leading: ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.file(
+                                  f,
+                                  width: 56,
+                                  height: 56,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, __, ___) => const Icon(Icons.image_not_supported, size: 40),
+                                ),
+                              ),
+                              title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              subtitle: Text('$mb MB'),
+                              trailing: Checkbox(
+                                value: checked,
+                                onChanged: (v) => setS(() { selected[f.path] = v == true; }),
+                              ),
+                              onTap: () => setS(() { selected[f.path] = !(selected[f.path] == true); }),
+                            );
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () => Navigator.pop(ctx),
+                          icon: const Icon(Icons.close),
+                          label: const Text('닫기'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: () async {
+                            final sel = <File>[];
+                            for (final f in pngs) {
+                              if (selected[f.path] == true) sel.add(f);
+                            }
+                            if (sel.isEmpty) return;
+                            Navigator.pop(ctx);
+                            await _sendPending(only: sel);
+                          },
+                          icon: const Icon(Icons.cloud_upload),
+                          label: const Text('선택 업로드'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        });
+      },
+    );
+  }
 
   // 추가 상태 (정책/로그/성능/버전)
   bool _wifiOnly = true; // 네트워크 정책: Wi‑Fi 전용 업로드
@@ -204,52 +437,75 @@ class _AppDashboardScreenState extends State<AppDashboardScreen> {
   Future<void> _syncNow() async {
     if (_syncing) return;
     if (_wifiOnly == true && !_online) {
-      // 온라인 체크가 OFFLINE이면 동기화 차단 (Wi‑Fi만 허용 정책 가정)
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('오프라인 상태입니다. Wi‑Fi 연결 후 다시 시도하세요.'), duration: Duration(seconds: 2)),
       );
       return;
     }
     setState(() { _syncing = true; });
+    int success = 0, skipped = 0, failed = 0;
     try {
-      final dir = await _pendingDir();
-      final entries = await dir.list().toList();
-      final pngs = entries.whereType<File>().where((f) => f.path.endsWith('.png')).toList();
-      int success = 0;
+      final pngs = await _listPendingPngs();
       for (final png in pngs) {
         final metaPath = png.path.replaceAll('.png', '.json');
         final metaFile = File(metaPath);
-        if (!await metaFile.exists()) continue;
+        if (!await metaFile.exists()) { skipped++; continue; }
         Map<String, dynamic> meta;
         try {
           meta = jsonDecode(await metaFile.readAsString()) as Map<String, dynamic>;
-        } catch (e) {
-          debugPrint('meta parse fail: $e');
-          continue;
-        }
+        } catch (_) { failed++; continue; }
+        final gps = (meta['gps'] as Map?) ?? const {};
+        final lat = (gps['lat'] as num?)?.toDouble();
+        final lon = (gps['lon'] as num?)?.toDouble();
+        if (lat == null || lon == null) { skipped++; continue; }
+
         final bytes = await png.readAsBytes();
         final req = http.MultipartRequest('POST', Uri.parse(_endpoint));
-        final fname = png.uri.pathSegments.last;
-        req.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fname));
-        final gps = (meta['gps'] as Map?) ?? {};
-        req.fields['gps_lat'] = (gps['lat'] ?? '').toString();
-        req.fields['gps_lon'] = (gps['lon'] ?? '').toString();
+        final lower = png.path.toLowerCase();
+        final isPng = lower.endsWith('.png');
+        final fname = png.uri.pathSegments.last; // 확장자 변경하지 않음
+        final mediaType = isPng ? MediaType('image', 'png') : MediaType('image', 'jpeg');
+        req.files.add(http.MultipartFile.fromBytes('file', bytes, filename: fname, contentType: mediaType));
+        req.headers['Accept'] = 'application/json';
+        req.fields['gps_lat']   = lat.toString();
+        req.fields['gps_lon']   = lon.toString();
         req.fields['timestamp'] = DateTime.now().toIso8601String();
         req.fields['device_id'] = (meta['device_id'] ?? 'unknown').toString();
+        req.fields['conf']      = (meta['conf'] ?? 0.25).toString();
+        req.fields['iou']       = (meta['iou']  ?? 0.50).toString();
+        req.fields['max_size']  = (meta['max_size'] ?? 1280).toString();
+
         try {
-          final resp = await req.send();
+          final streamed = await req.send();
+          final resp = await http.Response.fromStream(streamed);
           if (resp.statusCode == 200) {
             success++;
-            await png.delete();
-            await metaFile.delete();
+            try { await png.delete(); } catch (_) {}
+            try { await metaFile.delete(); } catch (_) {}
+          } else {
+            failed++;
+            debugPrint('Upload failed (${resp.statusCode}) for ${png.path}: ${resp.body}');
           }
-        } catch (_) {/* ignore and retry next time */}
+        } catch (e) {
+          failed++;
+          debugPrint('sync error for ${png.path}: $e');
+        }
       }
       if (success > 0) {
         await _writeLastSyncNow();
       }
+      if (!mounted) return;
+      final msg = '동기화 완료: 성공 $success · 실패 $failed · 스킵 $skipped';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), duration: const Duration(seconds: 3)),
+      );
     } catch (e) {
       debugPrint('syncNow error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('동기화 오류: $e'), duration: const Duration(seconds: 3)),
+        );
+      }
     } finally {
       await _scanQueue();
       await _pingOnline();
@@ -288,14 +544,30 @@ class _AppDashboardScreenState extends State<AppDashboardScreen> {
             ),
             const SizedBox(height: 12),
             _InfoCard(
-              title: '오프라인 큐',
+              title: '업로드 대기 큐',
               value: '$_pendingCount건',
               caption: '${_pendingMB.toStringAsFixed(2)} MB 대기 중',
               accent: cs.primary,
-              trailing: ElevatedButton.icon(
-                onPressed: (_pendingCount == 0 || _syncing) ? null : _syncNow,
-                icon: _syncing ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.sync),
-                label: Text(_syncing ? '동기화 중…' : '지금 동기화'),
+              trailing: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: (_pendingCount == 0 || _syncing) ? null : () => _sendPending(),
+                    icon: _syncing ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.cloud_upload),
+                    label: Text(_syncing ? '업로드 중…' : '전체 업로드'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: (_pendingCount == 0 || _syncing) ? null : _openManualSendSheet,
+                    icon: const Icon(Icons.checklist_rtl),
+                    label: const Text('선택 업로드'),
+                  ),
+                  TextButton.icon(
+                    onPressed: (_pendingCount == 0 || _syncing) ? null : _clearQueueConfirm,
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('큐 비우기'),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 12),
@@ -377,13 +649,11 @@ class _InfoCard extends StatelessWidget {
                   Text(value, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800, letterSpacing: -0.2)),
                   const SizedBox(height: 4),
                   Text(caption, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).hintColor)),
+                  const SizedBox(height: 8),
+                  if (trailing != null) trailing!,
                 ],
               ),
             ),
-            if (trailing != null) ...[
-              const SizedBox(width: 12),
-              trailing!,
-            ]
           ],
         ),
       ),
