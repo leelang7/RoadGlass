@@ -103,7 +103,7 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
           filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
           child: Container(
             width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 18),
+            padding: const EdgeInsets.symmetric(vertical: 14),
             decoration: BoxDecoration(
               color: _primary.withOpacity(0.12),
               borderRadius: BorderRadius.circular(40),
@@ -123,7 +123,7 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
               style: TextStyle(
                 color: _primary,
                 fontWeight: FontWeight.bold,
-                fontSize: 22,
+                fontSize: 20,
                 letterSpacing: 1.1,
               ),
             ),
@@ -163,7 +163,7 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
                     child: Column(
                       mainAxisSize: MainAxisSize.max,
                       children: [
-                        const SizedBox(height: 56),
+                        const SizedBox(height: 40),
                         FadeTransition(
                           opacity: _iconAnimation,
                           child: Hero(
@@ -187,13 +187,13 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
                               padding: const EdgeInsets.all(28),
                               child: Icon(
                                 Icons.photo_camera_rounded,
-                                size: 96,
+                                size: 48,
                                 color: Colors.white.withOpacity(0.9),
                               ),
                             ),
                           ),
                         ),
-                        const SizedBox(height: 48),
+                        const SizedBox(height: 12),
                         FadeTransition(
                           opacity: _titleAnimation,
                           child: Hero(
@@ -202,7 +202,7 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
                               'RoadGlass',
                               textAlign: TextAlign.center,
                               style: TextStyle(
-                                fontSize: 48,
+                                fontSize: 34,
                                 fontWeight: FontWeight.w900,
                                 color: _primary,
                                 letterSpacing: 1.5,
@@ -225,7 +225,7 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
                             '당신의 안전한 운전을 위한 가이드',
                             textAlign: TextAlign.center,
                             style: TextStyle(
-                              fontSize: 16,
+                              fontSize: 14,
                               fontWeight: FontWeight.w500,
                               color: _navy.withOpacity(0.85),
                               letterSpacing: 0.8,
@@ -234,22 +234,20 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
                           ),
                         ),
                         const SizedBox(height: 16),
-                        // 가이드 스텝은 필요 시 스크롤되도록 분리
-                        Expanded(
-                          child: ListView(
-                            physics: const BouncingScrollPhysics(),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              const SizedBox(height: 16),
                               _buildGuideStep(Icons.stay_current_landscape, "스마트폰을 차량 거치대에\n단단히 고정하세요."),
-                              const SizedBox(height: 16),
+                              const SizedBox(height: 10),
                               _buildGuideStep(Icons.cleaning_services, "렌즈를 깨끗하게 유지해\n인식률을 높이세요."),
-                              const SizedBox(height: 16),
+                              const SizedBox(height: 10),
                               _buildGuideStep(Icons.traffic, "표지판, 차선 등 도로 요소가\n잘 보이게 촬영하세요."),
-                              const SizedBox(height: 16),
+                              const SizedBox(height: 10),
                               _buildGuideStep(Icons.block, "운전 중에는 조작하지 말고,\n정차 후 이용하세요."),
-                              const SizedBox(height: 16),
+                              const SizedBox(height: 10),
                               _buildGuideStep(Icons.lock, "촬영 데이터는\n안전하게 보호됩니다"),
-                              const SizedBox(height: 16),
                             ],
                           ),
                         ),
@@ -270,7 +268,7 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
 
   Widget _buildGuideStep(IconData icon, String text) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
       decoration: BoxDecoration(
         color: Colors.white.withOpacity(0.9),
         borderRadius: BorderRadius.circular(16),
@@ -285,14 +283,14 @@ class _GuideScreenState extends State<GuideScreen> with SingleTickerProviderStat
       ),
       child: Row(
         children: [
-          Icon(icon, color: _primary, size: 28),
+          Icon(icon, color: _primary, size: 24),
           const SizedBox(width: 16),
           Expanded(
             child: Text(
               text,
               style: TextStyle(
                 color: _navy,
-                fontSize: 16,
+                fontSize: 14,
                 fontWeight: FontWeight.w600,
               ),
             ),

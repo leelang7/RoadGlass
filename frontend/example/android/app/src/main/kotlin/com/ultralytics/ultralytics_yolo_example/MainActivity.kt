@@ -13,6 +13,15 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.OutputStream
+import android.graphics.Bitmap
+import android.view.PixelCopy
+import android.os.Handler
+import android.os.Looper
+import java.io.ByteArrayOutputStream
+import android.view.TextureView
+import android.view.View
+import android.view.ViewGroup
+import android.view.Surface
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "app.gallery_saver"
@@ -40,6 +49,46 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 else -> result.notImplemented()
+            }
+        }
+        // Native camera capture channel: capture directly from the camera TextureView surface (no Flutter overlays)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "app.camera_capture").setMethodCallHandler { call, result ->
+            if (call.method == "capture") {
+                val textureView = findFirstTextureView(window.decorView)
+                if (textureView == null || !textureView.isAvailable) {
+                    result.error("NO_TEXTURE", "TextureView not found or not available", null)
+                    return@setMethodCallHandler
+                }
+
+                val w = textureView.width.coerceAtLeast(1)
+                val h = textureView.height.coerceAtLeast(1)
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+                // Use the TextureView's Surface for PixelCopy (captures native camera frame only)
+                val surface = Surface(textureView.surfaceTexture)
+                try {
+                    PixelCopy.request(surface, bmp, { copyResult ->
+                        try {
+                            if (copyResult == PixelCopy.SUCCESS) {
+                                val stream = ByteArrayOutputStream()
+                                // JPEG is smaller and widely supported
+                                bmp.compress(Bitmap.CompressFormat.JPEG, 92, stream)
+                                result.success(stream.toByteArray())
+                            } else {
+                                result.error("COPY_FAIL", "PixelCopy failed: $copyResult", null)
+                            }
+                        } finally {
+                            bmp.recycle()
+                            surface.release()
+                        }
+                    }, Handler(Looper.getMainLooper()))
+                } catch (e: Throwable) {
+                    bmp.recycle()
+                    surface.release()
+                    result.error("EX", e.message, null)
+                }
+            } else {
+                result.notImplemented()
             }
         }
     }
@@ -89,5 +138,15 @@ class MainActivity : FlutterActivity() {
             }
             applicationContext.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
         }
+    }
+    private fun findFirstTextureView(root: View): TextureView? {
+        if (root is TextureView) return root
+        if (root is ViewGroup) {
+            for (i in 0 until root.childCount) {
+                val found = findFirstTextureView(root.getChildAt(i))
+                if (found != null) return found
+            }
+        }
+        return null
     }
 }
