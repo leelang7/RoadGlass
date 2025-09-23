@@ -51,7 +51,7 @@ class MainScreen extends StatelessWidget {
                 children: [
                   _BentoItem(spanX: 2, spanY: 2, child: _GlassTile(label: '실시간 감지', icon: Icons.camera_alt_rounded, route: '/guide', accent: const Color(0xFF60A5FA))),
                   _BentoItem(spanX: 2, spanY: 2, child: _GlassTile(label: '대시보드', icon: Icons.dashboard_rounded, route: '/dashboard', accent: const Color(0xFFF59E0B))),
-                  _BentoItem(spanX: 2, spanY: 2, child: _GlassTile(label: '이미지 업로드', icon: Icons.file_upload_rounded, route: '/upload', accent: const Color(0xFFA78BFA))),
+                  _BentoItem(spanX: 2, spanY: 2, child: _GlassTile(label: '이미지 업로드', icon: Icons.file_upload_rounded, route: '/upload_gallery', accent: const Color(0xFFA78BFA))),
                   _BentoItem(spanX: 2, spanY: 2, child: _GlassTile(label: '히스토리', icon: Icons.history_rounded, route: '/history', accent: const Color(0xFF34D399))),
                   _BentoItem(spanX: 2, spanY: 2, child: _GlassTile(label: '알림 센터', icon: Icons.notifications_active_rounded, route: '/notifications', accent: const Color(0xFFFB7185))),
                 ],

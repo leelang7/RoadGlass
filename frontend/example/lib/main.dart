@@ -5,6 +5,7 @@ import 'presentation/screens/loading_screen.dart';
 import 'presentation/screens/guide_screen.dart';
 import 'presentation/screens/setting_screen.dart';
 import 'presentation/screens/app_dashboard_screen.dart';
+import 'presentation/screens/upload_gallery_screen.dart';
 
 void main() {
   runApp(const App());
@@ -29,6 +30,7 @@ class App extends StatelessWidget {
         '/guide': (_) => const GuideScreen(),
         // '/settings': (_) => const SettingScreen(),
         '/dashboard': (_) => const AppDashboardScreen(),
+        '/upload_gallery': (_) => const UploadGalleryScreen(),
       },
     );
   }
