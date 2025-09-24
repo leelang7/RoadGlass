@@ -29,15 +29,14 @@ AI 기반 **차선 · 정지선 · 횡단보도 마모/훼손도 분석 플랫�
 
 ## 🏗️ 전체 아키텍처
 
-```mermaid
-flowchart LR
-  A[📱 모바일 앱(Flutter)] -->|이미지+GPS+시간| B[⚡ FastAPI 서버]
-  B -->|YOLO Segmentation| C[🧮 WearScore 계산]
-  C -->|INSERT| D[(🗄️ PostgreSQL DB)]
-  C -->|저장| E[📂 ./RoadGlass/orig & overlay]
-  D --> F[🌐 웹 대시보드(React/Flutter Web)]
-  E --> F
-```
+Mobile App (Flutter)
+        │  (image + GPS + timestamp)
+        ▼
+    FastAPI Server ── YOLO Segmentation ──> WearScore Calculation
+        │ INSERT                          │ save
+        ▼                                 ▼
+   PostgreSQL DB                    ./RoadGlass/{orig,overlay}
+        └──────────────► Web Dashboard (React/Flutter Web) ◄──────────────┘
 
 ------
 
@@ -48,8 +47,8 @@ flowchart LR
 ```
 RoadGlass/
  ├─ backend/                # FastAPI 서버
- │   ├─ blur_server.py      # ⬇️ 이 README 맨 아래 전체 코드 그대로 저장
- │   └─ requirements.txt    # ⬇️ 이 README 중간의 블록을 그대로 저장
+ │   ├─ blur_server.py      
+ │   └─ requirements.txt    
  │
  ├─ mobile/                 # Flutter 앱 (선택)
  │   └─ ...
