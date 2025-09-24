@@ -281,3 +281,9 @@ curl http://localhost:8000/health
 ```
 http://localhost:8000/docs
 ```
+
+
+
+## 📜 라이선스
+
+프로젝트용 (상용 시 별도 라이선스 협의)
