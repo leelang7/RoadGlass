@@ -1,10 +1,12 @@
-# 🚧 RoadGlass LaneWear
+# 🚧 RoadGlass
 
 AI 기반 **차선 · 정지선 · 횡단보도 마모/훼손도 분석 플랫폼**  
-모바일 크로스플랫폼(Flutter) → FastAPI 서버 → PostgreSQL 저장 → 대시보드(Web)까지  
-**촬영 → 업로드 → 분석 → 시각화 → 유지보수 의사결정** 전 과정을 자동화합니다.
+모바일 크로스플랫폼(Flutter) → FastAPI 서버 → PostgreSQL 저장 → 대시보드(Web)
+**촬영 → 업로드 → 분석 → 시각화 → 유지보수 의사결정** 전 과정을 자동화
 
 ---
+
+
 
 ## ✨ 주요 기능
 
@@ -92,7 +94,7 @@ BLUR_METHOD="gaussian"                           # or "pixelate"
 ## 🚀 서버 실행
 
 ```
-# 1) 가상환경 권장
+# 1) 가상환경 권장(Anaconda 권장)
 python -m venv .venv && source .venv/bin/activate
 
 # 2) 요구 패키지 설치
@@ -187,7 +189,9 @@ CREATE TABLE lane_wear_results (
 
 ------
 
-## 🧪 Python 클라이언트 (초간단)
+
+
+## 🧪 Python 클라이언트(테스트)
 
 ```
 # lane_client.py
@@ -224,6 +228,8 @@ print(r.json())
 
 ------
 
+
+
 ## 🧭 WearScore 구성요소
 
 - 📐 픽셀 면적
@@ -233,6 +239,8 @@ print(r.json())
 - 👁️ 평균 confidence 기반 Visibility
 
 ------
+
+
 
 ## 📦 `backend/requirements.txt`
 
