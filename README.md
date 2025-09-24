@@ -29,14 +29,14 @@ AI 기반 **차선 · 정지선 · 횡단보도 마모/훼손도 분석 플랫�
 
 ## 🏗️ 전체 아키텍처
 
-flowchart LR
-  A[Mobile App (Flutter)] -->|image + GPS + timestamp| B[FastAPI Server]
-  B -->|YOLO Segmentation| C[WearScore Calculation]
-  C -->|INSERT| D[(PostgreSQL DB)]
-  C -->|save| E[./RoadGlass/{orig, overlay}]
-  D --> F[Web Dashboard (React/Flutter Web)]
-  E --> F
-  
+Mobile App (Flutter)
+        │  (image + GPS + timestamp)
+        ▼
+    FastAPI Server ── YOLO Segmentation ──> WearScore Calculation
+        │ INSERT                          │ save
+        ▼                                 ▼
+   PostgreSQL DB                    ./RoadGlass/{orig,overlay}
+        └──────────────► Web Dashboard (React/Flutter Web) ◄──────────────┘
 
 ------
 
