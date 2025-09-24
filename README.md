@@ -35,7 +35,9 @@ flowchart LR
   D --> F[웹 대시보드(React/Flutter Web)]
   E --> F
 
-## 📦 서버 폴더 구조
+---
+
+📦 서버 폴더 구조
 backend/
  ├─ blur_server.py        # FastAPI 앱 (LaneWear API)
  ├─ requirements.txt
@@ -43,12 +45,15 @@ backend/
      ├─ orig/             # 블러 반영 원본
      └─ overlay/          # 분석 오버레이
 
-## 🔧 요구사항
+🔧 요구사항
+
 Python 3.11+
+
 PostgreSQL 12+ (JSONB + 집계)
+
 CUDA GPU 권장 (CPU도 가능)
 
-## ⚙️ 환경변수 예시 (.env)
+⚙️ 환경변수 예시 (.env)
 DB_URL="postgresql+psycopg://postgres:postgres@<host>:5432/postgres"
 RG_STORE_DIR="./RoadGlass"
 PUBLIC_BASE_URL="https://api.example.com"
@@ -57,11 +62,21 @@ YOLO_LANE_MODEL="best_model.pt"
 YOLO_MODEL="yolov11n-face.pt"            # 얼굴
 YOLO_LP_MODEL="license-plate-v1x.pt"     # 번호판
 
-## 🚀 실행
+🚀 실행
 pip install -r requirements.txt
 uvicorn blur_server:app --host 0.0.0.0 --port 8000
 
-## 🔌 API 요약
+
+헬스체크:
+
+curl http://localhost:8000/health
+
+
+OpenAPI 문서:
+
+http://localhost:8000/docs
+
+🔌 API 요약
 POST /lane_wear_infer
 
 입력: file, gps_lat, gps_lon, timestamp, device_id
@@ -69,13 +84,16 @@ POST /lane_wear_infer
 출력: overall.wear_score, per_class, db_id, 이미지 URL
 
 저장: DB row + RoadGlass/orig/{id}.jpg + RoadGlass/overlay/{id}.jpg
+
+예시:
+
 curl -X POST http://localhost:8000/lane_wear_infer \
   -F "file=@./sample.jpg" \
   -F "gps_lat=37.5665" -F "gps_lon=126.9780" \
   -F "timestamp=2025-09-24T06:12:00Z" \
   -F "device_id=rg-unit-001"
 
-## 🗄️ DB 스키마
+🗄️ DB 스키마
 CREATE TABLE lane_wear_results (
   id SERIAL PRIMARY KEY,
   created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -91,7 +109,7 @@ CREATE TABLE lane_wear_results (
   device_id VARCHAR(255)
 );
 
-## 📱 모바일 (Flutter)
+📱 모바일 (Flutter)
 
 공용 코드베이스: Android / iOS / Web 지원
 
@@ -107,7 +125,7 @@ CREATE TABLE lane_wear_results (
 
 http, geolocator, google_maps_flutter, flutter_map, dio
 
-## 💻 프론트엔드 대시보드
+💻 프론트엔드 대시보드
 
 Flutter Web 또는 React 기반
 
@@ -119,10 +137,10 @@ Flutter Web 또는 React 기반
 
 유지보수 후보 우선순위 표 (/candidates/rank)
 
-## 🧪 Python 클라이언트(테스트)
+🧪 Python 클라이언트
 python lane_client.py --origin http://localhost:8000 test.jpg
 
-## 🗺️ 클래스 라벨 예시
+🗺️ 클래스 라벨 예시
 
 stop_line — 정지선
 
@@ -134,7 +152,7 @@ traffic_lane_yellow_{solid|dotted}
 
 traffic_lane_blue_{solid|dotted}
 
-## 🧭 WearScore 계산 요소
+🧭 WearScore 계산 요소
 
 차선/정지선/횡단보도 픽셀 면적
 
@@ -146,7 +164,6 @@ Skeleton 길이 → 두께 추정
 
 Confidence 기반 Visibility
 
-## 📜 라이선스
+📜 라이선스
 
-프로젝트용 (상용 시 별도 라이선스 적용)
-
+내부 프로젝트용 (상용 시 별도 라이선스 적용)
