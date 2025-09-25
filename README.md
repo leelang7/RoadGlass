@@ -45,7 +45,7 @@ Mobile App (Flutter)
 
 
 
-## 📦 프로젝트 구조(권장)
+## 📦 프로젝트 구조
 
 ```
 RoadGlass/
