@@ -1,6 +1,6 @@
 # 🚧 RoadGlass
 
-지능형(AI 기반) 도로안전 결함 탐지·보수관리 플랫폼  
+**지능형(AI 기반) 도로안전 결함 탐지·보수관리 플랫폼**
 모바일 크로스플랫폼(Flutter) → FastAPI 서버 → PostgreSQL 저장 → 대시보드(Web)
 **촬영 → 업로드 → 분석 → 시각화 → 유지보수 의사결정** 전 과정을 자동화
 
@@ -52,10 +52,10 @@ RoadGlass/
  │   ├─ blur_server.py      
  │   └─ requirements.txt    
  │
- ├─ mobile/                 # Flutter 앱 (선택)
+ ├─ frontend/                 # Flutter 앱
  │   └─ ...
  │
- ├─ web/                    # Web 대시보드 (선택)
+ ├─ web/                    # Web 대시보드
  │   └─ ...
  │
  └─ README.md               # 바로 이 파일
