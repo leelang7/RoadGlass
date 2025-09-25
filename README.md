@@ -59,7 +59,7 @@ RoadGlass/
  ├─ web/                    # Web 대시보드
  │   └─ ...
  │
- └─ README.md               # 바로 이 파일
+ └─ README.md               
 ```
 
 
