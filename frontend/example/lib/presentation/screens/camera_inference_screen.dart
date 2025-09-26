@@ -8,7 +8,6 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart'; // for MediaType
 import 'package:geolocator/geolocator.dart';
 import 'package:device_info_plus/device_info_plus.dart';
-// import 'package:gallery_saver/gallery_saver.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
@@ -19,6 +18,7 @@ import 'package:ultralytics_yolo/yolo_result.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
 import '../../services/imu_manager.dart';
 import '../../services/log_writer.dart'; 
+import '../../widgets/center_toast.dart';
 
 /// Shim for ImageGallerySaver API bridged to native MethodChannel.
 class ImageGallerySaver {
@@ -73,7 +73,7 @@ class CameraInferenceScreen extends StatefulWidget {
   State<CameraInferenceScreen> createState() => _CameraInferenceScreenState();
 }
 
-class _CameraInferenceScreenState extends State<CameraInferenceScreen> with SingleTickerProviderStateMixin {
+class _CameraInferenceScreenState extends State<CameraInferenceScreen> with SingleTickerProviderStateMixin, AutomaticKeepAliveClientMixin {
   // Backend base URL (unified)
   static const String kBaseUrl = 'http://ec2-54-67-48-0.us-west-1.compute.amazonaws.com';
   static const String kInferPath = '/lane_wear_infer';
@@ -135,6 +135,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   // One-time debug dump flag (replaces the invalid local static var)
   bool _dumpedFirstResult = false;
 
+  // Throttle UI setState to reduce platform view churn (black-flash mitigation)
+  DateTime _lastUiSetState = DateTime.fromMillisecondsSinceEpoch(0);
+  static const Duration _minUiSetStateInterval = Duration(milliseconds: 250);
   
 
   // === Wear score helpers ===
@@ -293,18 +296,22 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       final nowUs = DateTime.now().microsecondsSinceEpoch;
       final s = _imu.closest(nowUs);
       if (!mounted) return;
-      setState(() {
-        _lastImu = s == null
-            ? null
-            : {
-                "t_us": s.tUs,
-                "acc": {"x": s.ax, "y": s.ay, "z": s.az},
-                "gyro": {"x": s.gx, "y": s.gy, "z": s.gz},
-                "lin_acc": {"x": s.lax, "y": s.lay, "z": s.laz},
-              };
-        // Call IMU check/send after updating _lastImu
-        _checkImuAndSend();
-      });
+      final newImu = s == null
+          ? null
+          : {
+              "t_us": s.tUs,
+              "acc": {"x": s.ax, "y": s.ay, "z": s.az},
+              "gyro": {"x": s.gx, "y": s.gy, "z": s.gz},
+              "lin_acc": {"x": s.lax, "y": s.lay, "z": s.laz},
+            };
+      _lastImu = newImu; // update without forcing a rebuild every tick
+      final now = DateTime.now();
+      if (now.difference(_lastUiSetState) >= _minUiSetStateInterval) {
+        _lastUiSetState = now;
+        if (mounted) setState(() {});
+      }
+      // IMU-driven capture check does not need a rebuild
+      _checkImuAndSend();
       if (_logging && _lastImu != null) {
         final nowUs2 = DateTime.now().microsecondsSinceEpoch;
         if (nowUs2 - _lastDetLogUs > 500000) { // 0.5초 경과
@@ -432,6 +439,9 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
   }
 
   @override
+  bool get wantKeepAlive => true;
+
+  @override
   void dispose() {
     _imu.stop();
     if (_logging) _log.close();
@@ -472,9 +482,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     try {
       if (!_cameraReady || _yoloKey.currentContext == null) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('카메라가 아직 시작되지 않았습니다.')),
-          );
+          CenterToast.show(context, message: '카메라가 아직 시작되지 않았습니다.', type: ToastType.info);
         }
         return;
       }
@@ -495,53 +503,41 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
 
       // 2) Fallback: Flutter screenshot of YOLOView (overlays suppressed)
       if (pngBytes == null) {
-        if (mounted) {
-          setState(() { _suppressOverlayForCapture = true; });
+        // Single frame boundary wait to ensure the view is painted
+        await WidgetsBinding.instance.endOfFrame;
+        final boundary = _yoloKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+        if (boundary == null) {
+          debugPrint('⚠️ RepaintBoundary not found for capture');
+          if (mounted) {
+            CenterToast.show(context, message: '화면 캡쳐에 실패했습니다 (boundary).', type: ToastType.error);
+          }
+          return;
         }
-        await WidgetsBinding.instance.endOfFrame;
-        await Future.delayed(const Duration(milliseconds: 16));
-        await WidgetsBinding.instance.endOfFrame;
-
+        // If not yet painted, wait one short tick
+        if (boundary.debugNeedsPaint) {
+          await Future.delayed(const Duration(milliseconds: 16));
+        }
         ui.Image? image;
         try {
-          final boundary = _yoloKey.currentContext!.findRenderObject() as RenderRepaintBoundary?;
-          if (boundary == null) {
-            debugPrint('⚠️ RepaintBoundary not found for capture');
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (boundary).')),
-              );
-            }
-            return;
-          }
           image = await boundary.toImage(pixelRatio: 1.5);
           capW = image.width;
           capH = image.height;
           final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
           if (byteData == null) {
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('화면 캡쳐에 실패했습니다 (bytes).')),
-              );
+              CenterToast.show(context, message: '화면 캡쳐에 실패했습니다 (bytes).', type: ToastType.error);
             }
             return;
           }
           pngBytes = byteData.buffer.asUint8List();
         } finally {
           try { image?.dispose(); } catch (_) {}
-          if (mounted) {
-            setState(() { _suppressOverlayForCapture = false; });
-          } else {
-            _suppressOverlayForCapture = false;
-          }
         }
       }
       if (pngBytes == null) {
         // Should not happen, but guard anyway
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('캡쳐 실패: 이미지 바이트가 비어있습니다.')),
-          );
+          CenterToast.show(context, message: '캡쳐 실패: 이미지 바이트가 비어있습니다.', type: ToastType.error);
         }
         return;
       }
@@ -585,9 +581,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
       // 저장 성공 피드백 (선택)
       if (mounted) {
         final ok = (result is Map && (result['isSuccess'] == true || result['filePath'] != null));
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(ok ? '📸 갤러리에 저장됨' : '❌ 갤러리 저장 실패')),
-        );
+        CenterToast.show(context, message: ok ? '📸 갤러리에 저장됨' : '❌ 갤러리 저장 실패', type: ok ? ToastType.success : ToastType.error);
       }
 
       // === Manual capture → unconditional enqueue & sync ===
@@ -636,9 +630,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     } catch (e) {
       debugPrint('❌ Manual capture failed: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('캡쳐 중 오류가 발생했습니다.')),
-        );
+        CenterToast.show(context, message: '캡쳐 중 오류가 발생했습니다.', type: ToastType.error);
       }
     }
   }
@@ -795,17 +787,13 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
             await png.delete();
             await metaFile.delete();
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('업로드 성공 (200): $fname')),
-              );
+              CenterToast.show(context, message: '업로드 성공 (200): $fname', type: ToastType.success);
             }
           } else {
             final code = resp.statusCode;
             debugPrint('❌ Sync failed ($code): $shortBody');
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('업로드 실패 ($code): ${shortBody.isEmpty ? '응답 없음' : shortBody}')),
-              );
+              CenterToast.show(context, message: '업로드 실패 ($code): ${shortBody.isEmpty ? '응답 없음' : shortBody}', type: ToastType.error);
             }
           }
         } catch (e) {
@@ -1232,14 +1220,18 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
     }
 
     // 6) 화면 갱신 (기존대로)
-    setState(() {
-      _lastSegResults = results;
-      _lastImu = record["imu"] as Map<String, dynamic>?;
-    });
+    _lastSegResults = results;
+    _lastImu = record["imu"] as Map<String, dynamic>?;
+    final nowSet = DateTime.now();
+    if (mounted && nowSet.difference(_lastUiSetState) >= _minUiSetStateInterval) {
+      _lastUiSetState = nowSet;
+      setState(() {});
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     debugPrint("🔄 Building CameraInferenceScreen - modelPath: $_modelPath, isLoading: $_isModelLoading");
     debugPrint("🔄 YOLOView will be built with controller: $_yoloController");
 
@@ -1272,7 +1264,7 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                       Positioned.fill(
                         child: RepaintBoundary(
                           key: _yoloKey,
-                          child: _yoloView ?? const SizedBox(),
+                          child: _yoloView ?? const SizedBox.shrink(),
                         ),
                       ),
                       //  세그 폴리곤/마스크를 그리는 오버레이
@@ -1280,9 +1272,11 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                         child: Visibility(
                           visible: !_suppressOverlayForCapture,
                           maintainState: true,
-                          child: IgnorePointer(
-                            child: CustomPaint(
-                              painter: LaneOverlayPainter(results: _lastSegResults),
+                          child: RepaintBoundary(
+                            child: IgnorePointer(
+                              child: CustomPaint(
+                                painter: LaneOverlayPainter(results: _lastSegResults),
+                              ),
                             ),
                           ),
                         ),
@@ -1493,16 +1487,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> with Sing
                 await file.delete();
                 debugPrint("🗑️ run_log.jsonl deleted");
                 if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('run_log.jsonl deleted')),
-                  );
+                  CenterToast.show(context, message: 'run_log.jsonl deleted', type: ToastType.success);
                 }
               } else {
                 debugPrint("⚠️ run_log.jsonl not found");
                 if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('run_log.jsonl not found')),
-                  );
+                  CenterToast.show(context, message: 'run_log.jsonl not found', type: ToastType.info);
                 }
               }
             },

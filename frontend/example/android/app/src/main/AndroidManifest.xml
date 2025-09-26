@@ -52,6 +52,14 @@
         android:maxSdkVersion="29"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+
+    <!-- Android 13+ 갤러리 접근 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- 선택 사진만 허용(안드로이드 포토 피커 경로) -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <!-- EXIF에서 위치를 읽으려면(선택) -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
     <!-- Location for tagging captured data -->
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
